@@ -25,8 +25,7 @@ jobs:
         id: changelog
         uses: janheinrichmerker/action-github-changelog-generator@v2.4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }} 
-          sinceTag: v0.15.0
+          token: ${{ secrets.GITHUB_TOKEN }}
           output: CHANGELOG_NIGHTLY.md
           # Exclude issues that were closed without resolution from changelog
           excludeLabels: 'stale,wontfix,duplicate,invalid,question,use-as-is,not_planned'
