@@ -1,0 +1,4 @@
+{
+  "name": "usermod_motor_controller",
+  "build": { "libArchive": false }
+}
