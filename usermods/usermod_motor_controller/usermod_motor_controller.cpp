@@ -1013,6 +1013,58 @@ public:
   uint16_t getId() {
     return USERMOD_ID_MOTOR_CONTROLLER;
   }
+
+  // ---------------------------
+  // MQTT Command Handling (for Home Assistant integration)
+  // ---------------------------
+  void onMqttConnect(bool sessionPresent) override {
+#ifndef WLED_DISABLE_MQTT
+    // Subscribe to motor control topic: {mqttDeviceTopic}/motor/command
+    if (mqttDeviceTopic[0] != 0) {
+      char subuf[64];
+      strcpy(subuf, mqttDeviceTopic);
+      strcat_P(subuf, PSTR("/motor/command"));
+      mqtt->subscribe(subuf, 0);
+
+      // Publish initial state
+      publishHomeAssistantSensor();
+    }
+#endif
+  }
+
+  bool onMqttMessage(char* topic, char* payload) override {
+#ifndef WLED_DISABLE_MQTT
+    // Topic comes pre-stripped of device prefix
+    // We're looking for "/motor/command"
+    if (strlen(topic) >= 14 && strncmp_P(topic, PSTR("/motor/command"), 14) == 0) {
+      String action = payload;
+      action.toLowerCase();
+
+      if (action == "toggle" || action == "press") {
+        // Toggle motor state (like pressing the touch button)
+        if (motorState == IDLE) {
+          beginStart();
+        } else {
+          beginStop(STOP_USER);
+        }
+        return true;
+      } else if (action == "start" || action == "on" || action == "open") {
+        // Start motor (only if idle)
+        if (motorState == IDLE) {
+          beginStart();
+        }
+        return true;
+      } else if (action == "stop" || action == "off" || action == "close") {
+        // Stop motor (only if running)
+        if (motorState != IDLE) {
+          beginStop(STOP_USER);
+        }
+        return true;
+      }
+    }
+#endif
+    return false;
+  }
 };
 
 // Instance and registration

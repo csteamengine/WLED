@@ -72,7 +72,10 @@ WLED JSON API state fields (write):
 - `targetEnabled` - enable/disable target distance auto-stop
 - `distancePerTick` - set distance per hall tick
 
-Optional MQTT telemetry for Home Assistant
+MQTT telemetry and command support for Home Assistant
+
+**MQTT Command Topic** (receive):
+- `{mqttDeviceTopic}/motor/command` - accepts: "toggle", "start", "stop", "on", "off", "open", "close", "press"
 
 ---
 
@@ -215,6 +218,107 @@ Add to your PlatformIO environment:
 
 lib_deps =
   adafruit/Adafruit INA219
+
+---
+
+## Home Assistant Integration
+
+This usermod can be controlled via MQTT, making it easy to integrate with Home Assistant and voice assistants like Alexa.
+
+### Prerequisites
+
+1. MQTT broker (e.g., Mosquitto) running and configured in Home Assistant
+2. WLED configured with MQTT enabled (Sync Interfaces > MQTT)
+3. Note your WLED's MQTT device topic (e.g., `wled/drinkbar`)
+
+### MQTT Topics
+
+**Command Topic** (to control motor):
+```
+{mqttDeviceTopic}/motor/command
+```
+
+**Accepted Payloads**:
+- `toggle` or `press` - Toggle motor (start if idle, stop if running)
+- `start` or `on` or `open` - Start motor (only if idle)
+- `stop` or `off` or `close` - Stop motor (only if running)
+
+**State Topics** (published by WLED):
+- `{mqttDeviceTopic}/motor_state` - "idle", "starting", "running", "stopping"
+- `{mqttDeviceTopic}/motor_direction` - "forward" or "reverse"
+- `{mqttDeviceTopic}/motor_current_ma` - Current draw in mA
+- `{mqttDeviceTopic}/motor_position_ticks` - Position in encoder ticks
+
+### Home Assistant Configuration
+
+Add to your `configuration.yaml`:
+
+```yaml
+mqtt:
+  button:
+    - name: "Drink Bar Motor"
+      unique_id: drinkbar_motor_toggle
+      command_topic: "wled/drinkbar/motor/command"
+      payload_press: "toggle"
+      icon: mdi:glass-cocktail
+
+  sensor:
+    - name: "Drink Bar Motor State"
+      unique_id: drinkbar_motor_state
+      state_topic: "wled/drinkbar/motor_state"
+      icon: mdi:engine
+
+    - name: "Drink Bar Motor Current"
+      unique_id: drinkbar_motor_current
+      state_topic: "wled/drinkbar/motor_current_ma"
+      unit_of_measurement: "mA"
+      device_class: current
+```
+
+Replace `wled/drinkbar` with your actual MQTT device topic.
+
+### Alexa Integration
+
+Once you have the Home Assistant button entity, you can expose it to Alexa:
+
+1. In Home Assistant, go to **Settings > Voice assistants > Alexa**
+2. Expose the "Drink Bar Motor" button entity
+3. Create an Alexa Routine:
+   - **Trigger**: Voice command "I need a drink"
+   - **Action**: Smart Home > Control device > Drink Bar Motor > Press
+
+Now saying "Alexa, I need a drink" will trigger the motor!
+
+### Alternative: Home Assistant Automation
+
+Create an automation that responds to any trigger:
+
+```yaml
+automation:
+  - alias: "Voice Trigger Drink Bar"
+    trigger:
+      # Your trigger here (Alexa routine, button, etc.)
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "wled/drinkbar/motor/command"
+          payload: "toggle"
+```
+
+### Testing via MQTT
+
+You can test the integration using mosquitto_pub:
+
+```bash
+# Toggle motor
+mosquitto_pub -h your-broker -t "wled/drinkbar/motor/command" -m "toggle"
+
+# Start motor
+mosquitto_pub -h your-broker -t "wled/drinkbar/motor/command" -m "start"
+
+# Stop motor
+mosquitto_pub -h your-broker -t "wled/drinkbar/motor/command" -m "stop"
+```
 
 ---
 
