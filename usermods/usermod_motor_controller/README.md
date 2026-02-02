@@ -65,17 +65,27 @@ WLED JSON API state fields (read):
 - `lastStopReason` - "user", "spike", "timeout", or "target"
 
 WLED JSON API state fields (write):
-- `start` - set to true to start motor
-- `stop` - set to true to stop motor
-- `resetPos` - set to true to reset position to zero
+- `toggle` - toggle motor state (start if idle, stop if running)
+- `start` - start motor in current direction
+- `stop` - stop motor
+- `open` - start motor in opening direction (direction-aware)
+- `close` - start motor in closing direction (direction-aware)
+- `resetPos` - reset position to zero
 - `targetDistance` - set target distance
 - `targetEnabled` - enable/disable target distance auto-stop
 - `distancePerTick` - set distance per hall tick
+- `ledControlEnabled` - enable/disable LED control based on lid position
+- `ledInvertDirection` - swap which direction is open vs closed
 
 MQTT telemetry and command support for Home Assistant
 
 **MQTT Command Topic** (receive):
-- `{mqttDeviceTopic}/motor/command` - accepts: "toggle", "start", "stop", "on", "off", "open", "close", "press"
+- `{mqttDeviceTopic}/motor/command` - accepts:
+  - `toggle` / `press` - toggle motor state
+  - `start` / `on` - start in current direction
+  - `stop` / `off` - stop motor
+  - `open` - start in opening direction (uses `ledInvertDirection` config)
+  - `close` - start in closing direction (uses `ledInvertDirection` config)
 
 ---
 
@@ -240,8 +250,12 @@ This usermod can be controlled via MQTT, making it easy to integrate with Home A
 
 **Accepted Payloads**:
 - `toggle` or `press` - Toggle motor (start if idle, stop if running)
-- `start` or `on` or `open` - Start motor (only if idle)
-- `stop` or `off` or `close` - Stop motor (only if running)
+- `start` or `on` - Start motor in current direction (only if idle)
+- `stop` or `off` - Stop motor (only if running)
+- `open` - Start motor in **opening** direction (direction-aware, only if idle)
+- `close` - Start motor in **closing** direction (direction-aware, only if idle)
+
+> **Note:** The `open` and `close` commands use the `ledInvertDirection` setting to determine which physical direction is "opening". Configure this in WLED's usermod settings.
 
 **State Topics** (published by WLED):
 - `{mqttDeviceTopic}/motor_state` - "idle", "starting", "running", "stopping"
@@ -256,11 +270,25 @@ Add to your `configuration.yaml`:
 ```yaml
 mqtt:
   button:
-    - name: "Drink Bar Motor"
+    # Toggle button (alternates direction each press)
+    - name: "Drink Bar Toggle"
       unique_id: drinkbar_motor_toggle
       command_topic: "wled/drinkbar/motor/command"
       payload_press: "toggle"
       icon: mdi:glass-cocktail
+
+    # Direction-aware buttons (always move in specified direction)
+    - name: "Drink Bar Open"
+      unique_id: drinkbar_motor_open
+      command_topic: "wled/drinkbar/motor/command"
+      payload_press: "open"
+      icon: mdi:arrow-up-bold
+
+    - name: "Drink Bar Close"
+      unique_id: drinkbar_motor_close
+      command_topic: "wled/drinkbar/motor/command"
+      payload_press: "close"
+      icon: mdi:arrow-down-bold
 
   sensor:
     - name: "Drink Bar Motor State"
@@ -279,15 +307,17 @@ Replace `wled/drinkbar` with your actual MQTT device topic.
 
 ### Alexa Integration
 
-Once you have the Home Assistant button entity, you can expose it to Alexa:
+Once you have the Home Assistant button entities, you can expose them to Alexa:
 
 1. In Home Assistant, go to **Settings > Voice assistants > Alexa**
-2. Expose the "Drink Bar Motor" button entity
+2. Expose the "Drink Bar Open" button entity
 3. Create an Alexa Routine:
    - **Trigger**: Voice command "I need a drink"
-   - **Action**: Smart Home > Control device > Drink Bar Motor > Press
+   - **Action**: Smart Home > Control device > Drink Bar Open > Press
 
-Now saying "Alexa, I need a drink" will trigger the motor!
+Now saying "Alexa, I need a drink" will always open the drink bar (regardless of its current state)!
+
+You can also create a routine for "close the drink bar" using the Close button.
 
 ### Alternative: Home Assistant Automation
 
@@ -310,15 +340,27 @@ automation:
 You can test the integration using mosquitto_pub:
 
 ```bash
-# Toggle motor
+# Toggle motor (alternates direction)
 mosquitto_pub -h your-broker -t "wled/drinkbar/motor/command" -m "toggle"
 
-# Start motor
-mosquitto_pub -h your-broker -t "wled/drinkbar/motor/command" -m "start"
+# Open (always moves in opening direction)
+mosquitto_pub -h your-broker -t "wled/drinkbar/motor/command" -m "open"
+
+# Close (always moves in closing direction)
+mosquitto_pub -h your-broker -t "wled/drinkbar/motor/command" -m "close"
 
 # Stop motor
 mosquitto_pub -h your-broker -t "wled/drinkbar/motor/command" -m "stop"
 ```
+
+### Configuring Open/Close Direction
+
+The `ledInvertDirection` setting in WLED's usermod config determines which physical direction is "open":
+
+- **`ledInvertDirection: false`** (default) - Forward = Opening, Reverse = Closing
+- **`ledInvertDirection: true`** - Forward = Closing, Reverse = Opening
+
+Set this in WLED web UI under Config > Usermods > MotorController.
 
 ---
 

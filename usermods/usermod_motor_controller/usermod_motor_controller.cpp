@@ -794,6 +794,18 @@ public:
       beginStop(STOP_USER);
     }
 
+    // Direction-aware open/close commands
+    // Uses ledInvertDirection to determine which physical direction is "open"
+    if (usermod["open"].as<bool>() && motorState == IDLE) {
+      motorDirection = !ledInvertDirection;  // Set to opening direction
+      beginStart();
+    }
+
+    if (usermod["close"].as<bool>() && motorState == IDLE) {
+      motorDirection = ledInvertDirection;  // Set to closing direction
+      beginStart();
+    }
+
     if (usermod["resetPos"].as<bool>()) {
       positionTicks = 0;
       runStartTicks = 0;
@@ -1048,16 +1060,31 @@ public:
           beginStop(STOP_USER);
         }
         return true;
-      } else if (action == "start" || action == "on" || action == "open") {
-        // Start motor (only if idle)
+      } else if (action == "start" || action == "on") {
+        // Start motor in current direction (only if idle)
         if (motorState == IDLE) {
           beginStart();
         }
         return true;
-      } else if (action == "stop" || action == "off" || action == "close") {
+      } else if (action == "stop" || action == "off") {
         // Stop motor (only if running)
         if (motorState != IDLE) {
           beginStop(STOP_USER);
+        }
+        return true;
+      } else if (action == "open") {
+        // Move in opening direction (uses ledInvertDirection config)
+        // ledInvertDirection: false = forward is opening, true = forward is closing
+        if (motorState == IDLE) {
+          motorDirection = !ledInvertDirection;  // Set to opening direction
+          beginStart();
+        }
+        return true;
+      } else if (action == "close") {
+        // Move in closing direction (uses ledInvertDirection config)
+        if (motorState == IDLE) {
+          motorDirection = ledInvertDirection;  // Set to closing direction
+          beginStart();
         }
         return true;
       }
