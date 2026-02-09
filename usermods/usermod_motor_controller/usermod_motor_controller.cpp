@@ -10,6 +10,10 @@
  * - Quadrature hall sensors for position tracking & direction detection
  * - INA219 current sensing to detect stall/endstop by current spike
  * - Configurable target travel distance with auto-stop
+ * - Bottom endstop switch for homing & absolute position tracking
+ * - Firmware travel limit (18" / 457.2mm) to protect linear actuator stroke
+ * - Homing sequence: motor must find bottom endstop before allowing upward travel
+ * - Safe boot: motor never moves automatically on power-up
  *
  * Updates:
  * - Lower default PWM frequency (1kHz)
@@ -17,6 +21,12 @@
  * - Optional kickstart to overcome static friction
  * - Hall sensor direction detection (determines actual spin direction)
  * - Configurable distance per hall tick and target travel distance
+ * - Bottom endstop with immediate stop (no decel ramp on endstop hit)
+ * - Absolute position tracking from home (mm from bottom endstop)
+ * - Travel limit enforcement: firmware hard limit at 457.2mm (18")
+ * - User-adjustable max travel clamped to firmware limit
+ * - Homing required before upward movement (safety against unknown position)
+ * - Home command via JSON API, MQTT, and UI button
  * - FIX for ESP32 "dangerous relocation: l32r" linker errors:
  *     Use a global free-function ISR + global volatile snapshot variables
  *     (avoid C++ member functions / instance access inside IRAM ISR)
@@ -68,6 +78,11 @@ private:
   int8_t in1Pin    = 26;  // Direction control 1 (IN1)
   int8_t in2Pin    = 27;  // Direction control 2 (IN2)
   int8_t touchPin  = 33;  // Capacitive touch sensor input (digital HIGH/LOW)
+
+  // Bottom endstop switch
+  int8_t endstopPin = 34;          // Endstop input (GPIO34 is input-only; needs external pull-up/down)
+  bool   endstopActiveLow = true;  // true = LOW when triggered (pull-up + NO switch to GND)
+  bool   endstopEnabled = true;    // Enable endstop functionality
 
   // Hall sensors (quadrature)
   int8_t hallAPin  = 32;  // Hall A input
@@ -154,6 +169,27 @@ private:
   float ticksPerMm = 1.0f; // placeholder (use distancePerTick instead)
 
   // ---------------------------
+  // Homing & Absolute Position
+  // ---------------------------
+  bool isHomed = false;              // Has the motor found its home (bottom endstop)?
+  float currentPositionMm = 0.0f;   // Absolute position in mm from home (0 = at endstop)
+
+  // Direction mapping: which motor direction is "down" (toward endstop)?
+  // false = reverse (motorDirection=false) is down; true = forward (motorDirection=true) is down
+  bool downIsForward = false;
+
+  // Invert motor direction: swaps IN1/IN2 logic so "forward" spins the opposite way.
+  // Use this if the motor runs backwards from expected without re-wiring.
+  bool invertMotorDirection = false;
+
+  // ---------------------------
+  // Travel Limits
+  // ---------------------------
+  // 18 inches = 457.2mm — firmware hard limit (actuator has 35" stroke, this keeps well within)
+  static constexpr float FIRMWARE_MAX_TRAVEL_MM = 457.2f;
+  float maxTravelDistance = 457.2f;  // User-adjustable max travel, clamped to firmware limit
+
+  // ---------------------------
   // Motor Motion State Machine
   // ---------------------------
   enum MotorState { IDLE, STARTING, RUNNING, STOPPING };
@@ -172,7 +208,7 @@ private:
   bool kickActive = false;
   unsigned long kickStartTime = 0;
 
-  enum StopReason { STOP_USER, STOP_SPIKE, STOP_TIMEOUT, STOP_TARGET_REACHED };
+  enum StopReason { STOP_USER, STOP_SPIKE, STOP_TIMEOUT, STOP_TARGET_REACHED, STOP_ENDSTOP, STOP_TRAVEL_LIMIT };
   StopReason lastStopReason = STOP_USER;
 
   // Touch detection state
@@ -265,6 +301,23 @@ private:
       sprintf_P(topic, PSTR("%s/motor_pwm"), mqttDeviceTopic);
       itoa(currentPwm, buf, 10);
       mqtt->publish(topic, 0, false, buf);
+
+      // Homing / endstop state
+      sprintf_P(topic, PSTR("%s/motor_homed"), mqttDeviceTopic);
+      mqtt->publish(topic, 0, false, isHomed ? "true" : "false");
+
+      if (endstopEnabled) {
+        sprintf_P(topic, PSTR("%s/motor_endstop"), mqttDeviceTopic);
+        mqtt->publish(topic, 0, false, isEndstopTriggered() ? "triggered" : "open");
+      }
+
+      sprintf_P(topic, PSTR("%s/motor_position_mm"), mqttDeviceTopic);
+      dtostrf(currentPositionMm, 0, 1, buf);
+      mqtt->publish(topic, 0, false, buf);
+
+      sprintf_P(topic, PSTR("%s/motor_max_travel_mm"), mqttDeviceTopic);
+      dtostrf(maxTravelDistance, 0, 1, buf);
+      mqtt->publish(topic, 0, false, buf);
     }
 #endif
   }
@@ -273,7 +326,9 @@ private:
   // Motor control primitives
   // ---------------------------
   void setDirectionPins(bool forward) {
-    if (forward) {
+    // Apply motor direction inversion (software swap of IN1/IN2 logic)
+    bool actual = invertMotorDirection ? !forward : forward;
+    if (actual) {
       digitalWrite(in1Pin, HIGH);
       digitalWrite(in2Pin, LOW);
     } else {
@@ -325,6 +380,50 @@ private:
     return fromPwm + (int)((float)(toPwm - fromPwm) * smoothProgress);
   }
 
+  // ---------------------------
+  // Endstop & Direction Helpers
+  // ---------------------------
+  bool isEndstopTriggered() {
+    if (!endstopEnabled) return false;
+    return digitalRead(endstopPin) == (endstopActiveLow ? LOW : HIGH);
+  }
+
+  bool isMovingDown() {
+    return downIsForward ? motorDirection : !motorDirection;
+  }
+
+  bool isMovingUp() {
+    return !isMovingDown();
+  }
+
+  // Set motor direction to "down" (toward endstop)
+  void setDirectionDown() {
+    motorDirection = downIsForward;
+  }
+
+  // Set motor direction to "up" (away from endstop)
+  void setDirectionUp() {
+    motorDirection = !downIsForward;
+  }
+
+  // Immediate hard stop — cuts power with no deceleration ramp.
+  // Used when hitting the endstop (don't keep pushing against physical stop).
+  void immediateStop(StopReason reason) {
+    digitalWrite(in1Pin, LOW);
+    digitalWrite(in2Pin, LOW);
+    applyPwm(0);
+
+    lastStopReason = reason;
+    motorState = IDLE;
+    kickActive = false;
+    spikeSampleCount = 0;
+
+    bool wasOpening = isOpeningDirection(motorDirection);
+    updateLedState(wasOpening);
+
+    publishHomeAssistantSensor();
+  }
+
   void beginStop(StopReason reason) {
     if (motorState == IDLE || motorState == STOPPING) return;
 
@@ -351,13 +450,44 @@ private:
     updateLedState(wasOpening);  // wasOpening means lid is now open
 
     motorState = IDLE;
-    motorDirection = !motorDirection;
+
+    // If not homed, keep direction as DOWN — user must home before going UP
+    if (endstopEnabled && !isHomed) {
+      setDirectionDown();
+    } else {
+      motorDirection = !motorDirection;
+    }
 
     spikeSampleCount = 0;
     publishHomeAssistantSensor();
   }
 
   void beginStart() {
+    // ---------------------------
+    // Pre-start safety checks
+    // ---------------------------
+    if (endstopEnabled) {
+      // If not homed, force direction DOWN to find home first
+      if (!isHomed) {
+        setDirectionDown();
+      }
+
+      // Don't start moving DOWN if endstop is already triggered
+      if (isMovingDown() && isEndstopTriggered()) {
+        // Already at home — set homed state and flip to UP
+        isHomed = true;
+        currentPositionMm = 0.0f;
+        positionTicks = 0;
+        setDirectionUp();
+        return;  // Don't start motor, we're already at the bottom
+      }
+
+      // Don't start moving UP if at or beyond travel limit
+      if (isHomed && isMovingUp() && currentPositionMm >= maxTravelDistance) {
+        return;  // At travel limit, refuse to go further up
+      }
+    }
+
     motorState = STARTING;
     runStartTime = millis();
     spikeSampleCount = 0;
@@ -501,6 +631,17 @@ private:
         directionConfidence = 1;
         detectedDirection = delta;
       }
+
+      // Update absolute position when homed and motor is active
+      if (isHomed && motorState != IDLE) {
+        float tickDistanceMm = fabsf((float)delta * distancePerTick);
+        if (isMovingUp()) {
+          currentPositionMm += tickDistanceMm;
+        } else {
+          currentPositionMm -= tickDistanceMm;
+          if (currentPositionMm < 0.0f) currentPositionMm = 0.0f;
+        }
+      }
     }
   }
 
@@ -556,6 +697,15 @@ public:
     // Touch input
     pinMode(touchPin, INPUT);
 
+    // Endstop input (GPIO 34-39 don't have internal pull-ups on ESP32)
+    if (endstopEnabled) {
+      if (endstopPin >= 34 && endstopPin <= 39) {
+        pinMode(endstopPin, INPUT);       // Needs external pull-up/pull-down
+      } else {
+        pinMode(endstopPin, INPUT_PULLUP); // Use internal pull-up
+      }
+    }
+
     // Hall inputs
     pinMode(hallAPin, INPUT_PULLUP);
     pinMode(hallBPin, INPUT_PULLUP);
@@ -590,6 +740,30 @@ public:
     }
     ina219Ok = ina219.begin();
 
+    // ---------------------------
+    // Boot-time endstop check
+    // ---------------------------
+    if (endstopEnabled) {
+      if (isEndstopTriggered()) {
+        // Endstop is triggered at boot — motor is at home (bottom)
+        isHomed = true;
+        currentPositionMm = 0.0f;
+        positionTicks = 0;
+        setDirectionUp();  // Next movement should go UP
+        // Lid is closed/down — LEDs should be OFF
+        updateLedState(false);
+      } else {
+        // Endstop NOT triggered — position is unknown, needs homing.
+        // First user-initiated movement will go DOWN to find home.
+        // Motor will NOT move automatically (safety: prevent pinch on power-up).
+        isHomed = false;
+        currentPositionMm = 0.0f;
+        setDirectionDown();  // Force first movement toward endstop
+        // Position unknown — default LEDs OFF for safety
+        updateLedState(false);
+      }
+    }
+
     initDone = true;
   }
 
@@ -598,6 +772,41 @@ public:
 
     // Process hall updates frequently
     processHallIfPending();
+
+    // ---------------------------
+    // Endstop monitoring (every loop iteration for safety)
+    // ---------------------------
+    if (endstopEnabled) {
+      bool endstopHit = isEndstopTriggered();
+
+      // If endstop triggers while motor is moving DOWN — IMMEDIATE stop
+      if (endstopHit && motorState != IDLE && isMovingDown()) {
+        immediateStop(STOP_ENDSTOP);
+        isHomed = true;
+        currentPositionMm = 0.0f;
+        positionTicks = 0;
+        setDirectionUp();  // Next movement goes UP
+        return;            // Skip rest of loop this iteration
+      }
+
+      // If endstop triggered while idle and not yet homed (e.g., manually pushed)
+      if (endstopHit && motorState == IDLE && !isHomed) {
+        isHomed = true;
+        currentPositionMm = 0.0f;
+        positionTicks = 0;
+        setDirectionUp();
+      }
+    }
+
+    // ---------------------------
+    // Travel limit check while motor is running UP
+    // ---------------------------
+    if (endstopEnabled && isHomed && motorState != IDLE && isMovingUp()) {
+      if (currentPositionMm >= maxTravelDistance) {
+        beginStop(STOP_TRAVEL_LIMIT);
+        return;
+      }
+    }
 
     // Touch toggles start/stop
     if (capTouchPressed()) {
@@ -667,6 +876,22 @@ public:
     motorStatus.add(st);
     motorStatus.add(motorDirection ? "Forward" : "Reverse");
 
+    // Homing / endstop status
+    if (endstopEnabled) {
+      JsonArray homeStatus = user.createNestedArray("Homed");
+      homeStatus.add(isHomed ? "Yes" : "NO - press button to home");
+
+      JsonArray endstopStatus = user.createNestedArray("Endstop");
+      endstopStatus.add(isEndstopTriggered() ? "TRIGGERED" : "Open");
+
+      if (isHomed) {
+        JsonArray absPos = user.createNestedArray("Position (mm)");
+        absPos.add(currentPositionMm);
+        absPos.add(" / ");
+        absPos.add(maxTravelDistance);
+      }
+    }
+
     // Show detected direction from hall sensors (actual spin direction)
     JsonArray hallDir = user.createNestedArray("Hall Direction");
     const char* detDir =
@@ -700,6 +925,8 @@ public:
         (lastStopReason == STOP_SPIKE)          ? "Current Spike" :
         (lastStopReason == STOP_TIMEOUT)        ? "Timeout" :
         (lastStopReason == STOP_TARGET_REACHED) ? "Target Reached" :
+        (lastStopReason == STOP_ENDSTOP)        ? "Endstop Hit" :
+        (lastStopReason == STOP_TRAVEL_LIMIT)   ? "Travel Limit" :
                                                   "User";
       stopReason.add(reason);
     }
@@ -715,17 +942,33 @@ public:
       ledCtrl.add(ledInvertDirection ? "Inverted" : "Normal");
     }
 
-    // Add control button to simulate touch sensor
+    // Add control buttons
     JsonArray btn = user.createNestedArray(F("Motor Control"));
     String buttonHtml = F("<button class=\"btn btn-xs\" onclick=\"requestJson({motorController:{toggle:true}});\">");
     if (motorState == IDLE) {
-      buttonHtml += F("<i class=\"icons off\">&#xe08f;</i> Start");
+      if (endstopEnabled && !isHomed) {
+        buttonHtml += F("<i class=\"icons off\">&#xe08f;</i> Home");
+      } else {
+        buttonHtml += F("<i class=\"icons off\">&#xe08f;</i> Start");
+      }
     } else {
       buttonHtml += F("<i class=\"icons on\">&#xe08f;</i> Stop");
     }
     buttonHtml += F("</button>");
+
+    // Add dedicated Home button when endstop is enabled
+    if (endstopEnabled) {
+      buttonHtml += F(" <button class=\"btn btn-xs\" onclick=\"requestJson({motorController:{home:true}});\">");
+      buttonHtml += F("<i class=\"icons\">&#xe08f;</i> Home");
+      buttonHtml += F("</button>");
+    }
+
     btn.add(buttonHtml);
-    btn.add(motorDirection ? F(" (Next: Fwd)") : F(" (Next: Rev)"));
+    if (endstopEnabled && !isHomed) {
+      btn.add(F(" (Needs homing)"));
+    } else {
+      btn.add(motorDirection ? F(" (Next: Fwd)") : F(" (Next: Rev)"));
+    }
   }
 
   void addToJsonState(JsonObject& root) {
@@ -751,7 +994,16 @@ public:
     // Last stop reason
     usermod["lastStopReason"] = (lastStopReason == STOP_SPIKE) ? "spike" :
                                 (lastStopReason == STOP_TIMEOUT) ? "timeout" :
-                                (lastStopReason == STOP_TARGET_REACHED) ? "target" : "user";
+                                (lastStopReason == STOP_TARGET_REACHED) ? "target" :
+                                (lastStopReason == STOP_ENDSTOP) ? "endstop" :
+                                (lastStopReason == STOP_TRAVEL_LIMIT) ? "travel_limit" : "user";
+
+    // Endstop / homing state
+    usermod["isHomed"] = isHomed;
+    usermod["endstopTriggered"] = endstopEnabled ? isEndstopTriggered() : false;
+    usermod["currentPositionMm"] = currentPositionMm;
+    usermod["maxTravelDistance"] = maxTravelDistance;
+    usermod["firmwareMaxTravel"] = FIRMWARE_MAX_TRAVEL_MM;
 
     // LED control state
     usermod["ledControlEnabled"] = ledControlEnabled;
@@ -762,12 +1014,23 @@ public:
     JsonObject usermod = root["motorController"];
     if (usermod.isNull()) return;
 
-    // Allow setting target distance via API
+    // Allow setting target distance via API (clamped to firmware limit)
     if (!usermod["targetDistance"].isNull()) {
       targetDistance = usermod["targetDistance"].as<float>();
+      if (targetDistance > maxTravelDistance) targetDistance = maxTravelDistance;
+      if (targetDistance > FIRMWARE_MAX_TRAVEL_MM) targetDistance = FIRMWARE_MAX_TRAVEL_MM;
     }
     if (!usermod["targetEnabled"].isNull()) {
       targetDistanceEnabled = usermod["targetEnabled"].as<bool>();
+    }
+
+    // Allow setting max travel distance via API (clamped to firmware limit)
+    if (!usermod["maxTravelDistance"].isNull()) {
+      maxTravelDistance = usermod["maxTravelDistance"].as<float>();
+      if (maxTravelDistance > FIRMWARE_MAX_TRAVEL_MM) maxTravelDistance = FIRMWARE_MAX_TRAVEL_MM;
+      if (maxTravelDistance < 0) maxTravelDistance = 0;
+      // Re-clamp target distance if needed
+      if (targetDistance > maxTravelDistance) targetDistance = maxTravelDistance;
     }
 
     // Allow setting distance per tick via API
@@ -806,6 +1069,21 @@ public:
       beginStart();
     }
 
+    // Home command: move DOWN to find endstop
+    if (usermod["home"].as<bool>() && motorState == IDLE && endstopEnabled) {
+      if (isEndstopTriggered()) {
+        // Already at home
+        isHomed = true;
+        currentPositionMm = 0.0f;
+        positionTicks = 0;
+        setDirectionUp();
+      } else {
+        isHomed = false;
+        setDirectionDown();
+        beginStart();
+      }
+    }
+
     if (usermod["resetPos"].as<bool>()) {
       positionTicks = 0;
       runStartTicks = 0;
@@ -831,6 +1109,18 @@ public:
 
     top["hallAPin"] = hallAPin;
     top["hallBPin"] = hallBPin;
+
+    // Endstop configuration
+    top["endstopPin"] = endstopPin;
+    top["endstopActiveLow"] = endstopActiveLow;
+    top["endstopEnabled"] = endstopEnabled;
+
+    // Direction mapping
+    top["downIsForward"] = downIsForward;
+    top["invertMotorDirection"] = invertMotorDirection;
+
+    // Travel limit
+    top["maxTravelDistance"] = maxTravelDistance;
 
     // Distance configuration
     top["distancePerTick"] = distancePerTick;
@@ -876,6 +1166,18 @@ public:
     hallAPin = 32;
     hallBPin = 35;
 
+    // Endstop defaults
+    endstopPin = 34;
+    endstopActiveLow = true;
+    endstopEnabled = true;
+
+    // Direction mapping defaults
+    downIsForward = false;
+    invertMotorDirection = false;
+
+    // Travel limit default
+    maxTravelDistance = FIRMWARE_MAX_TRAVEL_MM;
+
     // Distance defaults
     distancePerTick = 1.0f;
     targetDistance = 0.0f;
@@ -920,6 +1222,20 @@ public:
     ok &= getJsonValue(top["hallAPin"], hallAPin);
     ok &= getJsonValue(top["hallBPin"], hallBPin);
 
+    // Endstop configuration
+    ok &= getJsonValue(top["endstopPin"], endstopPin);
+    ok &= getJsonValue(top["endstopActiveLow"], endstopActiveLow);
+    ok &= getJsonValue(top["endstopEnabled"], endstopEnabled);
+
+    // Direction mapping
+    ok &= getJsonValue(top["downIsForward"], downIsForward);
+    ok &= getJsonValue(top["invertMotorDirection"], invertMotorDirection);
+
+    // Travel limit (clamped to firmware max)
+    ok &= getJsonValue(top["maxTravelDistance"], maxTravelDistance);
+    if (maxTravelDistance > FIRMWARE_MAX_TRAVEL_MM) maxTravelDistance = FIRMWARE_MAX_TRAVEL_MM;
+    if (maxTravelDistance < 0) maxTravelDistance = 0;
+
     // Distance configuration
     ok &= getJsonValue(top["distancePerTick"], distancePerTick);
     ok &= getJsonValue(top["targetDistance"], targetDistance);
@@ -928,6 +1244,10 @@ public:
 
     // Validate distancePerTick
     if (distancePerTick <= 0) distancePerTick = 1.0f;
+
+    // Clamp target distance to travel limit
+    if (targetDistance > maxTravelDistance) targetDistance = maxTravelDistance;
+    if (targetDistance > FIRMWARE_MAX_TRAVEL_MM) targetDistance = FIRMWARE_MAX_TRAVEL_MM;
 
     ok &= getJsonValue(top["accelTime"], accelTimeMs);
     ok &= getJsonValue(top["decelTime"], decelTimeMs);
@@ -985,9 +1305,19 @@ public:
     MCINFO("hallAPin", "<i>Quadrature encoder channel A</i>");
     MCINFO("hallBPin", "<i>Quadrature encoder channel B</i>");
 
+    // Endstop settings
+    MCINFO("endstopPin", "<i>Bottom endstop switch input (GPIO34-39 need external pull-up)</i>");
+    MCINFO("endstopActiveLow", "<i>true = LOW when triggered (NO switch + pull-up)</i>");
+    MCINFO("endstopEnabled", "<i>Enable bottom endstop for homing &amp; safety</i>");
+
+    // Direction & travel
+    MCINFO("downIsForward", "<i>false = reverse is DOWN (toward endstop)</i>");
+    MCINFO("invertMotorDirection", "<i>Swap IN1/IN2 logic if motor runs backwards</i>");
+    MCINFO("maxTravelDistance", "mm <i>Max UP travel from home (firmware limit: 457.2mm / 18&quot;)</i>");
+
     // Distance/position settings
     MCINFO("distancePerTick", "<i>Units traveled per encoder tick (e.g., mm)</i>");
-    MCINFO("targetDistance", "<i>Auto-stop distance (0 = disabled)</i>");
+    MCINFO("targetDistance", "<i>Auto-stop distance, clamped to max travel (0 = disabled)</i>");
     MCINFO("targetDistanceEnabled", "<i>Enable auto-stop at target distance</i>");
 
     // Motion timing
@@ -1085,6 +1415,22 @@ public:
         if (motorState == IDLE) {
           motorDirection = ledInvertDirection;  // Set to closing direction
           beginStart();
+        }
+        return true;
+      } else if (action == "home") {
+        // Home: move down to find endstop
+        if (motorState == IDLE && endstopEnabled) {
+          if (isEndstopTriggered()) {
+            isHomed = true;
+            currentPositionMm = 0.0f;
+            positionTicks = 0;
+            setDirectionUp();
+            publishHomeAssistantSensor();
+          } else {
+            isHomed = false;
+            setDirectionDown();
+            beginStart();
+          }
         }
         return true;
       }
