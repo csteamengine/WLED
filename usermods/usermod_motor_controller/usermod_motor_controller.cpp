@@ -1,14 +1,12 @@
 #include "wled.h"
-#include <Wire.h>
-#include <Adafruit_INA219.h>
 #include <math.h>
 
 /*
  * Motor Controller Usermod (WLED)
- * - PWM motor driver control (enablePin + IN1/IN2)
+ * - BTS7960 dual half-bridge motor driver (RPWM/LPWM + R_EN/L_EN)
  * - Capacitive touch start/stop toggle
  * - Quadrature hall sensors for position tracking & direction detection
- * - INA219 current sensing to detect stall/endstop by current spike
+ * - BTS7960 IS pin current sensing to detect stall/endstop by current spike
  * - Configurable target travel distance with auto-stop
  * - Bottom endstop switch for homing & absolute position tracking
  * - Firmware travel limit (18" / 457.2mm) to protect linear actuator stroke
@@ -32,8 +30,9 @@
  *     (avoid C++ member functions / instance access inside IRAM ISR)
  * - FIX: acceleration not working:
  *     Do NOT overwrite PWM with pwmMax in RUNNING state (we maintain currentPwm)
- * - FIX: spike detection only in one direction:
- *     Use fabsf(current_mA) so reversed current still triggers
+ * - Replaced INA219 with BTS7960 IS pin current sensing via ESP32 ADC
+ *     Reads both R_IS and L_IS, uses active half-bridge (max of both)
+ *     Configurable sense resistor and IS ratio for calibration
  */
 
 #if defined(ARDUINO_ARCH_ESP32)
@@ -72,26 +71,30 @@ void IRAM_ATTR hall_isr_capture() {
 class MotorControllerUsermod : public Usermod {
 private:
   // ---------------------------
-  // Pin Configuration
+  // Pin Configuration (BTS7960 motor driver)
   // ---------------------------
-  int8_t enablePin = 25;  // PWM pin for speed control (ENA)
-  int8_t in1Pin    = 26;  // Direction control 1 (IN1)
-  int8_t in2Pin    = 27;  // Direction control 2 (IN2)
-  int8_t touchPin  = 33;  // Capacitive touch sensor input (digital HIGH/LOW)
+  int8_t rpwmPin = 27;   // BTS7960 RPWM — PWM for extend direction
+  int8_t lpwmPin = 14;   // BTS7960 LPWM — PWM for retract direction
+  int8_t renPin  = 12;   // BTS7960 R_EN — enable extend half-bridge
+  int8_t lenPin  = 13;   // BTS7960 L_EN — enable retract half-bridge
+  int8_t touchPin = 33;  // Capacitive touch sensor input (digital HIGH/LOW)
 
   // Bottom endstop switch
-  int8_t endstopPin = 34;          // Endstop input (GPIO34 is input-only; needs external pull-up/down)
+  int8_t endstopPin = 22;          // Endstop input
   bool   endstopActiveLow = true;  // true = LOW when triggered (pull-up + NO switch to GND)
   bool   endstopEnabled = true;    // Enable endstop functionality
+  unsigned long endstopDebounceMs = 20;  // Debounce time for mechanical switch (ms)
+  unsigned long lastEndstopChangeTime = 0;  // Last time raw endstop reading changed
+  bool debouncedEndstopState = false;       // Debounced endstop triggered state
+  bool lastRawEndstopState = false;         // Previous raw reading for edge detection
 
   // Hall sensors (quadrature)
-  int8_t hallAPin  = 32;  // Hall A input
-  int8_t hallBPin  = 35;  // Hall B input (GPIO35 is input-only, OK)
+  int8_t hallAPin  = 32;  // Hall A input (encoder channel A)
+  int8_t hallBPin  = 35;  // Hall B input (encoder channel B, input-only OK)
 
-  // Optional: if you want to force I2C pins (ESP32 default usually 21/22)
-  bool   i2cCustomPins = false;
-  int8_t i2cSdaPin     = 21;
-  int8_t i2cSclPin     = 22;
+  // BTS7960 current sense pins (IS outputs → resistor to GND → ADC)
+  int8_t rIsPin = 39;  // R_IS analog input (ADC1, GPIO39/VN)
+  int8_t lIsPin = 36;  // L_IS analog input (ADC1, GPIO36/VP)
 
   // ---------------------------
   // Timing / Motion Parameters
@@ -107,11 +110,15 @@ private:
   // ---------------------------
   int pwmMin = 0;
   int pwmMax = 255;
-  int pwmChannel = 0;
+  int pwmChannelR = 0;  // LEDC channel for RPWM (extend)
+  int pwmChannelL = 1;  // LEDC channel for LPWM (retract)
 
   // Lower default frequency for many DC motor drivers
   int pwmFrequency = 1000; // was 5000
   int pwmResolution = 8;
+
+  // Tracks which half-bridge is active (after inversion applied)
+  bool activeDirectionForward = true;
 
   // Kickstart (helps overcome static friction / gearbox stiction)
   bool kickstartEnabled = true;
@@ -126,12 +133,16 @@ private:
   unsigned long touchLockoutMs = 300;
 
   // ---------------------------
-  // Current sensing (INA219)
+  // Current sensing (BTS7960 IS pins via ADC)
   // ---------------------------
-  Adafruit_INA219 ina219;
-  bool ina219Ok = false;
+  // IS pin circuit: IS_pin → resistor to GND → ADC reads voltage across resistor
+  // Motor current (mA) = ADC_voltage_mV * isRatio / isResistorOhms
+  float isResistorOhms = 4700.0f;  // Sense resistor value (4.7kΩ default)
+  float isRatio        = 8500.0f;  // BTS7960 current sense ratio (typ ~8500:1, calibrate per batch)
+  bool  currentSenseEnabled = true; // Enable current sensing via IS pins
+  uint8_t adcSampleCount = 4;      // Number of ADC samples to average (ESP32 ADC is noisy)
 
-  // Polling interval for INA219 (ms)
+  // Polling interval (ms)
   unsigned long currentPollMs = 50;
   unsigned long lastCurrentPoll = 0;
 
@@ -140,7 +151,7 @@ private:
   uint8_t spikeSamplesRequired  = 3;       // consecutive samples over threshold
   uint8_t spikeSampleCount      = 0;
 
-  // Exposed telemetry (signed, as INA219 may go negative when reversed)
+  // Exposed telemetry
   float lastCurrentmA = 0.0f;
 
   // ---------------------------
@@ -178,9 +189,16 @@ private:
   // false = reverse (motorDirection=false) is down; true = forward (motorDirection=true) is down
   bool downIsForward = false;
 
-  // Invert motor direction: swaps IN1/IN2 logic so "forward" spins the opposite way.
+  // Invert motor direction: swaps RPWM/LPWM logic so "forward" spins the opposite way.
   // Use this if the motor runs backwards from expected without re-wiring.
   bool invertMotorDirection = false;
+
+  // ---------------------------
+  // Stall Detection (encoder-based, Safety Layer 2)
+  // ---------------------------
+  bool stallDetectionEnabled = true;      // Enable stall detection via encoder timeout
+  unsigned long stallTimeoutMs = 150;     // No encoder pulse in this time = stalled (ms)
+  unsigned long lastHallTickTime = 0;     // Last time a hall encoder tick was processed
 
   // ---------------------------
   // Travel Limits
@@ -208,7 +226,7 @@ private:
   bool kickActive = false;
   unsigned long kickStartTime = 0;
 
-  enum StopReason { STOP_USER, STOP_SPIKE, STOP_TIMEOUT, STOP_TARGET_REACHED, STOP_ENDSTOP, STOP_TRAVEL_LIMIT };
+  enum StopReason { STOP_USER, STOP_SPIKE, STOP_TIMEOUT, STOP_TARGET_REACHED, STOP_ENDSTOP, STOP_TRAVEL_LIMIT, STOP_STALL };
   StopReason lastStopReason = STOP_USER;
 
   // Touch detection state
@@ -323,18 +341,14 @@ private:
   }
 
   // ---------------------------
-  // Motor control primitives
+  // Motor control primitives (BTS7960 dual half-bridge)
   // ---------------------------
+  // BTS7960 driving: PWM goes on RPWM or LPWM depending on direction.
+  // R_EN and L_EN are held HIGH when motor is active, LOW when idle.
   void setDirectionPins(bool forward) {
-    // Apply motor direction inversion (software swap of IN1/IN2 logic)
-    bool actual = invertMotorDirection ? !forward : forward;
-    if (actual) {
-      digitalWrite(in1Pin, HIGH);
-      digitalWrite(in2Pin, LOW);
-    } else {
-      digitalWrite(in1Pin, LOW);
-      digitalWrite(in2Pin, HIGH);
-    }
+    // Apply motor direction inversion (software swap of RPWM/LPWM logic)
+    activeDirectionForward = invertMotorDirection ? !forward : forward;
+    // Actual PWM routing happens in applyPwm()
   }
 
   void applyPwm(int pwmValue) {
@@ -342,10 +356,43 @@ private:
     currentPwm = pwmValue;
 
 #if defined(ARDUINO_ARCH_ESP32)
-    ledcWrite(pwmChannel, pwmValue);
+    if (activeDirectionForward) {
+      ledcWrite(pwmChannelR, pwmValue);  // RPWM active (extend)
+      ledcWrite(pwmChannelL, 0);         // LPWM off
+    } else {
+      ledcWrite(pwmChannelR, 0);         // RPWM off
+      ledcWrite(pwmChannelL, pwmValue);  // LPWM active (retract)
+    }
 #else
-    analogWrite(enablePin, pwmValue);
+    // Fallback for non-ESP32 (basic digital direction + analog PWM)
+    if (activeDirectionForward) {
+      analogWrite(rpwmPin, pwmValue);
+      analogWrite(lpwmPin, 0);
+    } else {
+      analogWrite(rpwmPin, 0);
+      analogWrite(lpwmPin, pwmValue);
+    }
 #endif
+  }
+
+  // Cut all motor outputs (both PWM channels to 0, disable half-bridges)
+  void coastMotor() {
+#if defined(ARDUINO_ARCH_ESP32)
+    ledcWrite(pwmChannelR, 0);
+    ledcWrite(pwmChannelL, 0);
+#else
+    analogWrite(rpwmPin, 0);
+    analogWrite(lpwmPin, 0);
+#endif
+    currentPwm = 0;
+    digitalWrite(renPin, LOW);
+    digitalWrite(lenPin, LOW);
+  }
+
+  // Enable both half-bridges (call before applying PWM)
+  void enableMotorDriver() {
+    digitalWrite(renPin, HIGH);
+    digitalWrite(lenPin, HIGH);
   }
 
   // S-curve (smoothstep) for gentle acceleration/deceleration
@@ -383,9 +430,23 @@ private:
   // ---------------------------
   // Endstop & Direction Helpers
   // ---------------------------
+  // Returns debounced endstop state. Call updateEndstopDebounce() every loop iteration.
   bool isEndstopTriggered() {
     if (!endstopEnabled) return false;
-    return digitalRead(endstopPin) == (endstopActiveLow ? LOW : HIGH);
+    return debouncedEndstopState;
+  }
+
+  // Update debounced endstop reading — must be called every loop iteration
+  void updateEndstopDebounce() {
+    if (!endstopEnabled) return;
+    bool rawState = digitalRead(endstopPin) == (endstopActiveLow ? LOW : HIGH);
+    if (rawState != lastRawEndstopState) {
+      lastRawEndstopState = rawState;
+      lastEndstopChangeTime = millis();
+    }
+    if (millis() - lastEndstopChangeTime >= endstopDebounceMs) {
+      debouncedEndstopState = lastRawEndstopState;
+    }
   }
 
   bool isMovingDown() {
@@ -409,9 +470,7 @@ private:
   // Immediate hard stop — cuts power with no deceleration ramp.
   // Used when hitting the endstop (don't keep pushing against physical stop).
   void immediateStop(StopReason reason) {
-    digitalWrite(in1Pin, LOW);
-    digitalWrite(in2Pin, LOW);
-    applyPwm(0);
+    coastMotor();
 
     lastStopReason = reason;
     motorState = IDLE;
@@ -438,10 +497,8 @@ private:
   }
 
   void finalizeStopAndToggleDirection() {
-    // Coast
-    digitalWrite(in1Pin, LOW);
-    digitalWrite(in2Pin, LOW);
-    applyPwm(0);
+    // Coast — disable both half-bridges
+    coastMotor();
 
     // Update LED state based on the direction we just finished
     // If we were opening (moving in opening direction), lid is now open -> LEDs ON
@@ -491,6 +548,7 @@ private:
     motorState = STARTING;
     runStartTime = millis();
     spikeSampleCount = 0;
+    lastHallTickTime = millis();  // Reset stall timer
 
     // Record starting position for distance tracking
     runStartTicks = positionTicks;
@@ -499,6 +557,8 @@ private:
     detectedDirection = 0;
     directionConfidence = 0;
 
+    // Enable BTS7960 half-bridges and set direction (PWM routing)
+    enableMotorDriver();
     setDirectionPins(motorDirection);
 
     // If we're starting to open the lid, turn LEDs on immediately
@@ -622,6 +682,7 @@ private:
     // Update detected direction from hall sensors
     if (delta != 0) {
       g_hallLastDelta = delta;
+      lastHallTickTime = millis();  // Track for stall detection
 
       // Build confidence in detected direction
       if (delta == detectedDirection) {
@@ -660,23 +721,41 @@ private:
   }
 
   // ---------------------------
-  // Current sensing + stall detect
+  // Current sensing (BTS7960 IS pins via ADC)
   // ---------------------------
+  // Reads both R_IS and L_IS, takes the higher value (only active half-bridge outputs current).
+  // Converts ADC voltage to motor current:  mA = (voltage_mV * isRatio) / isResistorOhms
+  float readMotorCurrentmA() {
+    // Average multiple ADC samples to reduce ESP32 ADC noise
+    const uint8_t samples = (adcSampleCount > 0) ? adcSampleCount : 1;
+    long sumR = 0, sumL = 0;
+    for (uint8_t i = 0; i < samples; i++) {
+      sumR += analogRead(rIsPin);
+      sumL += analogRead(lIsPin);
+    }
+    const int rawR = (int)(sumR / samples);
+    const int rawL = (int)(sumL / samples);
+    const int raw = max(rawR, rawL);
+
+    // ESP32 12-bit ADC: 0–4095 maps to 0–3300mV (with default 11dB attenuation)
+    const float voltage_mV = (float)raw * 3300.0f / 4095.0f;
+
+    // IS_current = voltage / resistor;  motor_current = IS_current * ratio
+    // Combined: motor_current_mA = voltage_mV * isRatio / isResistorOhms
+    return voltage_mV * isRatio / isResistorOhms;
+  }
+
   bool pollCurrentAndCheckSpike() {
-    if (!ina219Ok) return false;
+    if (!currentSenseEnabled) return false;
 
     const unsigned long now = millis();
     if (now - lastCurrentPoll < currentPollMs) return false;
     lastCurrentPoll = now;
 
-    // Signed current (can go negative if current reverses relative to shunt)
-    const float mA = ina219.getCurrent_mA();
+    const float mA = readMotorCurrentmA();
     lastCurrentmA = mA;
 
-    // Direction-agnostic spike detect
-    const float abs_mA = fabsf(mA);
-
-    if (abs_mA >= currentSpikeThresholdmA) {
+    if (mA >= currentSpikeThresholdmA) {
       if (spikeSampleCount < 255) spikeSampleCount++;
     } else {
       spikeSampleCount = 0;
@@ -689,10 +768,17 @@ public:
   void setup() {
     if (!enabled) return;
 
-    // Motor pins
-    pinMode(enablePin, OUTPUT);
-    pinMode(in1Pin, OUTPUT);
-    pinMode(in2Pin, OUTPUT);
+    // BTS7960 motor driver pins
+    pinMode(rpwmPin, OUTPUT);
+    pinMode(lpwmPin, OUTPUT);
+    pinMode(renPin, OUTPUT);
+    pinMode(lenPin, OUTPUT);
+
+    // GPIO12 is a strapping pin — must be LOW during/after boot or ESP32 may fail to start.
+    // Explicitly drive enables LOW immediately before any other setup.
+    digitalWrite(renPin, LOW);
+    digitalWrite(lenPin, LOW);
+    delay(100);  // Allow strapping pin to stabilize after boot
 
     // Touch input
     pinMode(touchPin, INPUT);
@@ -704,11 +790,16 @@ public:
       } else {
         pinMode(endstopPin, INPUT_PULLUP); // Use internal pull-up
       }
+      // Initialize debounce state from current reading
+      bool rawState = digitalRead(endstopPin) == (endstopActiveLow ? LOW : HIGH);
+      debouncedEndstopState = rawState;
+      lastRawEndstopState = rawState;
+      lastEndstopChangeTime = millis();
     }
 
-    // Hall inputs
-    pinMode(hallAPin, INPUT_PULLUP);
-    pinMode(hallBPin, INPUT_PULLUP);
+    // Hall inputs (no internal pullup — HE sensor board provides external pullups)
+    pinMode(hallAPin, INPUT);
+    pinMode(hallBPin, INPUT);
 
     // Initialize lastAB (safe here)
     lastAB = ((uint8_t)digitalRead(hallAPin) << 1) | (uint8_t)digitalRead(hallBPin);
@@ -722,23 +813,25 @@ public:
     attachInterrupt(digitalPinToInterrupt(hallBPin), hall_isr_capture, CHANGE);
 
 #if defined(ARDUINO_ARCH_ESP32)
-    // PWM LEDC setup
-    ledcSetup(pwmChannel, pwmFrequency, pwmResolution);
-    ledcAttachPin(enablePin, pwmChannel);
+    // PWM LEDC setup — two channels for BTS7960 RPWM/LPWM
+    ledcSetup(pwmChannelR, pwmFrequency, pwmResolution);
+    ledcAttachPin(rpwmPin, pwmChannelR);
+    ledcSetup(pwmChannelL, pwmFrequency, pwmResolution);
+    ledcAttachPin(lpwmPin, pwmChannelL);
 #endif
 
-    // Ensure motor is stopped on startup
-    digitalWrite(in1Pin, LOW);
-    digitalWrite(in2Pin, LOW);
-    applyPwm(0);
+    // Ensure motor is stopped on startup — disable both half-bridges
+    coastMotor();
 
-    // I2C + INA219
-    if (i2cCustomPins) {
-      Wire.begin(i2cSdaPin, i2cSclPin);
-    } else {
-      Wire.begin();
+    // BTS7960 IS pin ADC setup
+    if (currentSenseEnabled) {
+      pinMode(rIsPin, INPUT);
+      pinMode(lIsPin, INPUT);
+#if defined(ARDUINO_ARCH_ESP32)
+      analogSetAttenuation(ADC_11db);  // 0–3.3V range
+      analogReadResolution(12);        // 12-bit (0–4095)
+#endif
     }
-    ina219Ok = ina219.begin();
 
     // ---------------------------
     // Boot-time endstop check
@@ -772,6 +865,9 @@ public:
 
     // Process hall updates frequently
     processHallIfPending();
+
+    // Update debounced endstop state every iteration
+    updateEndstopDebounce();
 
     // ---------------------------
     // Endstop monitoring (every loop iteration for safety)
@@ -839,6 +935,12 @@ public:
       // Target distance reached => smooth auto-stop
       if (hasReachedTargetDistance()) {
         beginStop(STOP_TARGET_REACHED);
+        return;
+      }
+
+      // Encoder stall detection (Safety Layer 2): no hall tick in stallTimeoutMs
+      if (stallDetectionEnabled && (millis() - lastHallTickTime > stallTimeoutMs)) {
+        beginStop(STOP_STALL);
         return;
       }
 
@@ -927,13 +1029,14 @@ public:
         (lastStopReason == STOP_TARGET_REACHED) ? "Target Reached" :
         (lastStopReason == STOP_ENDSTOP)        ? "Endstop Hit" :
         (lastStopReason == STOP_TRAVEL_LIMIT)   ? "Travel Limit" :
+        (lastStopReason == STOP_STALL)          ? "Stall Detected" :
                                                   "User";
       stopReason.add(reason);
     }
 
-    if (!ina219Ok) {
-      JsonArray warn = user.createNestedArray("INA219");
-      warn.add("NOT DETECTED");
+    if (!currentSenseEnabled) {
+      JsonArray warn = user.createNestedArray("Current Sense");
+      warn.add("DISABLED");
     }
 
     // LED control status
@@ -996,7 +1099,8 @@ public:
                                 (lastStopReason == STOP_TIMEOUT) ? "timeout" :
                                 (lastStopReason == STOP_TARGET_REACHED) ? "target" :
                                 (lastStopReason == STOP_ENDSTOP) ? "endstop" :
-                                (lastStopReason == STOP_TRAVEL_LIMIT) ? "travel_limit" : "user";
+                                (lastStopReason == STOP_TRAVEL_LIMIT) ? "travel_limit" :
+                                (lastStopReason == STOP_STALL) ? "stall" : "user";
 
     // Endstop / homing state
     usermod["isHomed"] = isHomed;
@@ -1102,9 +1206,10 @@ public:
     JsonObject top = root.createNestedObject("MotorController");
     top["enabled"] = enabled;
 
-    top["enablePin"] = enablePin;
-    top["in1Pin"] = in1Pin;
-    top["in2Pin"] = in2Pin;
+    top["rpwmPin"] = rpwmPin;
+    top["lpwmPin"] = lpwmPin;
+    top["renPin"] = renPin;
+    top["lenPin"] = lenPin;
     top["touchPin"] = touchPin;
 
     top["hallAPin"] = hallAPin;
@@ -1114,10 +1219,15 @@ public:
     top["endstopPin"] = endstopPin;
     top["endstopActiveLow"] = endstopActiveLow;
     top["endstopEnabled"] = endstopEnabled;
+    top["endstopDebounceMs"] = endstopDebounceMs;
 
     // Direction mapping
     top["downIsForward"] = downIsForward;
     top["invertMotorDirection"] = invertMotorDirection;
+
+    // Stall detection
+    top["stallDetectionEnabled"] = stallDetectionEnabled;
+    top["stallTimeoutMs"] = stallTimeoutMs;
 
     // Travel limit
     top["maxTravelDistance"] = maxTravelDistance;
@@ -1140,15 +1250,17 @@ public:
     top["kickstartPwm"] = kickstartPwm;
     top["kickstartMs"] = kickstartMs;
 
-    top["ina219_ok"] = ina219Ok;
+    // BTS7960 current sense
+    top["rIsPin"] = rIsPin;
+    top["lIsPin"] = lIsPin;
+    top["isResistorOhms"] = isResistorOhms;
+    top["isRatio"] = isRatio;
+    top["currentSenseEnabled"] = currentSenseEnabled;
+    top["adcSampleCount"] = adcSampleCount;
 
     top["currentPollMs"] = currentPollMs;
     top["currentSpikeThresholdmA"] = currentSpikeThresholdmA;
     top["spikeSamplesRequired"] = spikeSamplesRequired;
-
-    top["i2cCustomPins"] = i2cCustomPins;
-    top["i2cSdaPin"] = i2cSdaPin;
-    top["i2cSclPin"] = i2cSclPin;
 
     // LED control settings
     top["ledControlEnabled"] = ledControlEnabled;
@@ -1158,22 +1270,28 @@ public:
   bool readFromConfig(JsonObject& root) {
     // Defaults
     enabled = true;
-    enablePin = 25;
-    in1Pin = 26;
-    in2Pin = 27;
+    rpwmPin = 27;
+    lpwmPin = 14;
+    renPin = 12;
+    lenPin = 13;
     touchPin = 33;
 
     hallAPin = 32;
     hallBPin = 35;
 
     // Endstop defaults
-    endstopPin = 34;
+    endstopPin = 22;
     endstopActiveLow = true;
     endstopEnabled = true;
+    endstopDebounceMs = 20;
 
     // Direction mapping defaults
     downIsForward = false;
     invertMotorDirection = false;
+
+    // Stall detection defaults
+    stallDetectionEnabled = true;
+    stallTimeoutMs = 150;
 
     // Travel limit default
     maxTravelDistance = FIRMWARE_MAX_TRAVEL_MM;
@@ -1196,13 +1314,17 @@ public:
     kickstartPwm = 255;
     kickstartMs = 120;
 
+    // BTS7960 IS pin defaults
+    rIsPin = 39;
+    lIsPin = 36;
+    isResistorOhms = 4700.0f;
+    isRatio = 8500.0f;
+    currentSenseEnabled = true;
+    adcSampleCount = 4;
+
     currentPollMs = 50;
     currentSpikeThresholdmA = 3500.0f;
     spikeSamplesRequired = 3;
-
-    i2cCustomPins = false;
-    i2cSdaPin = 21;
-    i2cSclPin = 22;
 
     // LED control defaults
     ledControlEnabled = false;
@@ -1214,9 +1336,10 @@ public:
     bool ok = true;
     ok &= getJsonValue(top["enabled"], enabled);
 
-    ok &= getJsonValue(top["enablePin"], enablePin);
-    ok &= getJsonValue(top["in1Pin"], in1Pin);
-    ok &= getJsonValue(top["in2Pin"], in2Pin);
+    ok &= getJsonValue(top["rpwmPin"], rpwmPin);
+    ok &= getJsonValue(top["lpwmPin"], lpwmPin);
+    ok &= getJsonValue(top["renPin"], renPin);
+    ok &= getJsonValue(top["lenPin"], lenPin);
     ok &= getJsonValue(top["touchPin"], touchPin);
 
     ok &= getJsonValue(top["hallAPin"], hallAPin);
@@ -1226,10 +1349,15 @@ public:
     ok &= getJsonValue(top["endstopPin"], endstopPin);
     ok &= getJsonValue(top["endstopActiveLow"], endstopActiveLow);
     ok &= getJsonValue(top["endstopEnabled"], endstopEnabled);
+    ok &= getJsonValue(top["endstopDebounceMs"], endstopDebounceMs);
 
     // Direction mapping
     ok &= getJsonValue(top["downIsForward"], downIsForward);
     ok &= getJsonValue(top["invertMotorDirection"], invertMotorDirection);
+
+    // Stall detection
+    ok &= getJsonValue(top["stallDetectionEnabled"], stallDetectionEnabled);
+    ok &= getJsonValue(top["stallTimeoutMs"], stallTimeoutMs);
 
     // Travel limit (clamped to firmware max)
     ok &= getJsonValue(top["maxTravelDistance"], maxTravelDistance);
@@ -1261,13 +1389,23 @@ public:
     ok &= getJsonValue(top["kickstartPwm"], kickstartPwm);
     ok &= getJsonValue(top["kickstartMs"], kickstartMs);
 
+    // BTS7960 IS pin config
+    ok &= getJsonValue(top["rIsPin"], rIsPin);
+    ok &= getJsonValue(top["lIsPin"], lIsPin);
+    ok &= getJsonValue(top["isResistorOhms"], isResistorOhms);
+    ok &= getJsonValue(top["isRatio"], isRatio);
+    ok &= getJsonValue(top["currentSenseEnabled"], currentSenseEnabled);
+    ok &= getJsonValue(top["adcSampleCount"], adcSampleCount);
+    if (adcSampleCount < 1) adcSampleCount = 1;
+    if (adcSampleCount > 16) adcSampleCount = 16;
+
+    // Validate IS parameters
+    if (isResistorOhms <= 0) isResistorOhms = 4700.0f;
+    if (isRatio <= 0) isRatio = 8500.0f;
+
     ok &= getJsonValue(top["currentPollMs"], currentPollMs);
     ok &= getJsonValue(top["currentSpikeThresholdmA"], currentSpikeThresholdmA);
     ok &= getJsonValue(top["spikeSamplesRequired"], spikeSamplesRequired);
-
-    ok &= getJsonValue(top["i2cCustomPins"], i2cCustomPins);
-    ok &= getJsonValue(top["i2cSdaPin"], i2cSdaPin);
-    ok &= getJsonValue(top["i2cSclPin"], i2cSclPin);
 
     // LED control settings
     ok &= getJsonValue(top["ledControlEnabled"], ledControlEnabled);
@@ -1277,12 +1415,15 @@ public:
     g_hallAPin = (uint8_t)hallAPin;
     g_hallBPin = (uint8_t)hallBPin;
 
-    // If PWM frequency changed via config, re-init LEDC
+    // If PWM frequency changed via config, re-init both LEDC channels
 #if defined(ARDUINO_ARCH_ESP32)
     if (initDone) {
-      ledcDetachPin(enablePin);
-      ledcSetup(pwmChannel, pwmFrequency, pwmResolution);
-      ledcAttachPin(enablePin, pwmChannel);
+      ledcDetachPin(rpwmPin);
+      ledcDetachPin(lpwmPin);
+      ledcSetup(pwmChannelR, pwmFrequency, pwmResolution);
+      ledcAttachPin(rpwmPin, pwmChannelR);
+      ledcSetup(pwmChannelL, pwmFrequency, pwmResolution);
+      ledcAttachPin(lpwmPin, pwmChannelL);
       applyPwm(currentPwm);
     }
 #endif
@@ -1297,10 +1438,11 @@ public:
     // Main enable
     MCINFO("enabled", "<i>Enable motor controller usermod</i>");
 
-    // Pin configuration section
-    MCINFO("enablePin", "<i>PWM speed control (connect to ENA)</i>");
-    MCINFO("in1Pin", "<i>Direction pin 1 (connect to IN1)</i>");
-    MCINFO("in2Pin", "<i>Direction pin 2 (connect to IN2)</i>");
+    // Pin configuration section (BTS7960)
+    MCINFO("rpwmPin", "<i>BTS7960 RPWM — PWM for extend direction</i>");
+    MCINFO("lpwmPin", "<i>BTS7960 LPWM — PWM for retract direction</i>");
+    MCINFO("renPin", "<i>BTS7960 R_EN — enable extend half-bridge</i>");
+    MCINFO("lenPin", "<i>BTS7960 L_EN — enable retract half-bridge</i>");
     MCINFO("touchPin", "<i>Capacitive touch or button input</i>");
     MCINFO("hallAPin", "<i>Quadrature encoder channel A</i>");
     MCINFO("hallBPin", "<i>Quadrature encoder channel B</i>");
@@ -1309,10 +1451,15 @@ public:
     MCINFO("endstopPin", "<i>Bottom endstop switch input (GPIO34-39 need external pull-up)</i>");
     MCINFO("endstopActiveLow", "<i>true = LOW when triggered (NO switch + pull-up)</i>");
     MCINFO("endstopEnabled", "<i>Enable bottom endstop for homing &amp; safety</i>");
+    MCINFO("endstopDebounceMs", "ms <i>Endstop switch debounce time (10-50ms for mechanical)</i>");
 
     // Direction & travel
     MCINFO("downIsForward", "<i>false = reverse is DOWN (toward endstop)</i>");
-    MCINFO("invertMotorDirection", "<i>Swap IN1/IN2 logic if motor runs backwards</i>");
+    MCINFO("invertMotorDirection", "<i>Swap RPWM/LPWM logic if motor runs backwards</i>");
+
+    // Stall detection
+    MCINFO("stallDetectionEnabled", "<i>Stop motor if encoder reports no movement</i>");
+    MCINFO("stallTimeoutMs", "ms <i>No encoder pulse for this long = stalled (100-300)</i>");
     MCINFO("maxTravelDistance", "mm <i>Max UP travel from home (firmware limit: 457.2mm / 18&quot;)</i>");
 
     // Distance/position settings
@@ -1335,15 +1482,16 @@ public:
     MCINFO("kickstartPwm", "<i>Kickstart pulse PWM (0-255)</i>");
     MCINFO("kickstartMs", "ms <i>Kickstart pulse duration</i>");
 
-    // Current sensing
-    MCINFO("currentPollMs", "ms <i>INA219 polling interval</i>");
-    MCINFO("currentSpikeThresholdmA", "mA <i>Current spike = endstop reached</i>");
+    // BTS7960 current sensing (IS pins)
+    MCINFO("rIsPin", "<i>BTS7960 R_IS analog input (ADC1 pin)</i>");
+    MCINFO("lIsPin", "<i>BTS7960 L_IS analog input (ADC1 pin)</i>");
+    MCINFO("isResistorOhms", "&Omega; <i>IS-to-GND sense resistor (e.g., 4700 for 4.7k&Omega;)</i>");
+    MCINFO("isRatio", "<i>Current sense ratio (typ ~8500, calibrate per batch)</i>");
+    MCINFO("currentSenseEnabled", "<i>Enable BTS7960 IS pin current sensing</i>");
+    MCINFO("adcSampleCount", "<i>ADC samples to average per reading (1-16, reduces noise)</i>");
+    MCINFO("currentPollMs", "ms <i>Current sense polling interval</i>");
+    MCINFO("currentSpikeThresholdmA", "mA <i>Current spike = stall/endstop detected</i>");
     MCINFO("spikeSamplesRequired", "<i>Consecutive samples over threshold to trigger</i>");
-
-    // I2C settings
-    MCINFO("i2cCustomPins", "<i>Use custom I2C pins instead of defaults</i>");
-    MCINFO("i2cSdaPin", "<i>Custom I2C data pin</i>");
-    MCINFO("i2cSclPin", "<i>Custom I2C clock pin</i>");
 
     // LED control
     MCINFO("ledControlEnabled", "<i>Turn LEDs on/off based on lid position</i>");
