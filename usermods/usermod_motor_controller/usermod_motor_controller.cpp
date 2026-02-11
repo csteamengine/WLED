@@ -110,8 +110,8 @@ private:
   // ---------------------------
   int pwmMin = 0;
   int pwmMax = 255;
-  int pwmChannelR = 0;  // LEDC channel for RPWM (extend)
-  int pwmChannelL = 1;  // LEDC channel for LPWM (retract)
+  int pwmChannelR = 4;  // LEDC channel for RPWM (extend) — use 4+ to avoid WLED conflicts
+  int pwmChannelL = 5;  // LEDC channel for LPWM (retract)
 
   // Lower default frequency for many DC motor drivers
   int pwmFrequency = 1000; // was 5000
@@ -121,7 +121,7 @@ private:
   bool activeDirectionForward = true;
 
   // Kickstart (helps overcome static friction / gearbox stiction)
-  bool kickstartEnabled = true;
+  bool kickstartEnabled = false;
   int  kickstartPwm = 255;
   unsigned long kickstartMs = 120;
 
@@ -508,12 +508,9 @@ private:
 
     motorState = IDLE;
 
-    // If not homed, keep direction as DOWN — user must home before going UP
-    if (endstopEnabled && !isHomed) {
-      setDirectionDown();
-    } else {
-      motorDirection = !motorDirection;
-    }
+    // Always toggle direction — beginStart() handles safety overrides
+    // (e.g., forcing DOWN when unhomed, redirecting at endstop)
+    motorDirection = !motorDirection;
 
     spikeSampleCount = 0;
     publishHomeAssistantSensor();
@@ -529,14 +526,14 @@ private:
         setDirectionDown();
       }
 
-      // Don't start moving DOWN if endstop is already triggered
+      // If trying to go DOWN but endstop is already triggered,
+      // redirect to UP and continue (don't silently consume the touch press)
       if (isMovingDown() && isEndstopTriggered()) {
-        // Already at home — set homed state and flip to UP
         isHomed = true;
         currentPositionMm = 0.0f;
         positionTicks = 0;
         setDirectionUp();
-        return;  // Don't start motor, we're already at the bottom
+        // Fall through to start the motor going UP
       }
 
       // Don't start moving UP if at or beyond travel limit
@@ -570,43 +567,22 @@ private:
     applyPwm(constrain(pwmMin, 0, 255));
 
     kickActive = false;
-    if (kickstartEnabled && kickstartMs > 0) {
-      kickActive = true;
-      kickStartTime = millis();
-      applyPwm(constrain(kickstartPwm, 0, 255));
-    } else {
-      rampStartTime = millis();
-      rampStartPwm = currentPwm;
-      rampTargetPwm = pwmMax;
-    }
+    rampStartTime = millis();
+    rampStartPwm = currentPwm;
+    rampTargetPwm = pwmMax;
 
     publishHomeAssistantSensor();
   }
 
   void updateStartSequence() {
     const unsigned long now = millis();
-
-    if (kickActive) {
-      if (now - kickStartTime >= kickstartMs) {
-        kickActive = false;
-
-        // Drop to pwmMin, then ramp up
-        applyPwm(constrain(pwmMin, 0, 255));
-        rampStartTime = now;
-        rampStartPwm = currentPwm;
-        rampTargetPwm = pwmMax;
-      } else {
-        return; // keep kick PWM
-      }
-    }
-
     const unsigned long elapsed = now - rampStartTime;
     const int pwm = computeRampPwm(elapsed, accelTimeMs, rampStartPwm, rampTargetPwm);
     applyPwm(pwm);
 
     if (elapsed >= accelTimeMs) {
-      // Do not force pwmMax elsewhere; currentPwm is now at target
       motorState = RUNNING;
+      lastHallTickTime = millis();  // Reset stall timer — don't penalize ramp-up time
       publishHomeAssistantSensor();
     }
   }
@@ -627,26 +603,29 @@ private:
   // Touch detection
   // ---------------------------
   bool capTouchPressed() {
-    const unsigned long currentTime = millis();
+    const unsigned long now = millis();
 
-    if (currentTime - lastTouchTime < touchLockoutMs) return false;
+    // Lockout prevents rapid re-triggers after a confirmed press
+    if (now - lastTouchTime < touchLockoutMs) return false;
 
-    const bool currentReading = digitalRead(touchPin);
+    const bool reading = digitalRead(touchPin) == HIGH;
 
-    if (currentReading == HIGH) {
+    if (reading) {
       if (touchSampleCount == 0) {
-        touchStartTime = currentTime;
+        // First HIGH reading — start debounce timer
+        touchStartTime = now;
         touchSampleCount = 1;
-      } else if (currentTime - touchStartTime < capDebounceMs) {
-        touchSampleCount++;
-        if (touchSampleCount >= touchSamples && !touchDetected) {
-          touchDetected = true;
-          lastTouchTime = currentTime;
-          return true;
-        }
+      }
+      // Signal has been continuously HIGH since touchStartTime
+      if (!touchDetected && (now - touchStartTime >= capDebounceMs)) {
+        // Stable HIGH for capDebounceMs — confirmed press
+        touchDetected = true;
+        lastTouchTime = now;
+        return true;
       }
     } else {
-      if (touchDetected) touchDetected = false;
+      // Signal LOW — reset detection state
+      touchDetected = false;
       touchSampleCount = 0;
     }
 
@@ -861,7 +840,10 @@ public:
   }
 
   void loop() {
-    if (!enabled || !initDone || strip.isUpdating()) return;
+    if (!enabled || !initDone) return;
+
+    // Motor control must run every iteration regardless of strip updates.
+    // GPIO reads, PWM writes, and touch detection are safe during DMA.
 
     // Process hall updates frequently
     processHallIfPending();
@@ -908,6 +890,9 @@ public:
     if (capTouchPressed()) {
       if (motorState == IDLE) {
         beginStart();
+      } else if (motorState == STOPPING) {
+        // Already decelerating — cut power immediately on touch
+        finalizeStopAndToggleDirection();
       } else {
         beginStop(STOP_USER);
       }
@@ -944,8 +929,8 @@ public:
         return;
       }
 
-      // Current spike => smooth auto-stop
-      if (pollCurrentAndCheckSpike()) {
+      // Current spike => smooth auto-stop (skip ADC reads during strip DMA)
+      if (!strip.isUpdating() && pollCurrentAndCheckSpike()) {
         beginStop(STOP_SPIKE);
         return;
       }
@@ -1310,7 +1295,7 @@ public:
     pwmMax = 255;
     pwmFrequency = 1000;
 
-    kickstartEnabled = true;
+    kickstartEnabled = false;
     kickstartPwm = 255;
     kickstartMs = 120;
 
