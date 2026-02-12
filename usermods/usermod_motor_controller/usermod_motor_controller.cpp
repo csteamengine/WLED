@@ -250,6 +250,7 @@ private:
   MotorState motorState = IDLE;
 
   bool motorDirection = true; // true = forward/up, false = reverse/down
+  bool manualJogActive = false; // true while UI hold-to-jog controls are active
   unsigned long runStartTime = 0;
 
   // ramp controller
@@ -519,6 +520,7 @@ private:
     if (toggleDirectionAfter) {
       motorDirection = !motorDirection;
     }
+    manualJogActive = false;
 
     publishHomeAssistantSensor();
   }
@@ -551,6 +553,7 @@ private:
     // Always toggle direction — beginStart() handles safety overrides
     // (e.g., forcing DOWN when unhomed, redirecting at endstop)
     motorDirection = !motorDirection;
+    manualJogActive = false;
 
     spikeSampleCount = 0;
     publishHomeAssistantSensor();
@@ -560,7 +563,7 @@ private:
     // ---------------------------
     // Pre-start safety checks
     // ---------------------------
-    if (endstopEnabled) {
+    if (endstopEnabled && !manualJogActive) {
       // If not homed, force direction DOWN to find home first
       if (!isHomed) {
         setDirectionDown();
@@ -612,6 +615,26 @@ private:
     rampTargetPwm = pwmMax;
 
     publishHomeAssistantSensor();
+  }
+
+  void startManualJog(bool moveUp) {
+    if (motorState != IDLE) return;
+    if (!moveUp && endstopEnabled && isEndstopTriggered()) {
+      // Already at bottom endstop: refuse downward jog to avoid pushing into the stop.
+      isHomed = true;
+      currentPositionMm = 0.0f;
+      positionTicks = 0;
+      setDirectionUp();
+      return;
+    }
+    manualJogActive = true;
+    if (moveUp) setDirectionUp();
+    else setDirectionDown();
+    beginStart();
+    if (motorState == IDLE) {
+      // Start was blocked by safety checks; clear manual mode.
+      manualJogActive = false;
+    }
   }
 
   void updateStartSequence() {
@@ -904,17 +927,23 @@ public:
     }
 
     // ---------------------------
-    // Travel limit check while motor is running UP
+    // Travel limit checks while moving UP
     // ---------------------------
-    // Only trigger travel-limit stop while actively accelerating/running.
-    // If we are already STOPPING, allow the stop sequence to finish;
-    // otherwise we can starve touch handling and never finalize the stop.
+    // Manual jog ignores user maxTravelDistance, but still enforces firmware hard limit.
+    // Normal movement enforces user maxTravelDistance (already clamped to firmware limit).
     if (endstopEnabled && isHomed &&
         (motorState == STARTING || motorState == RUNNING) &&
         isMovingUp()) {
-      if (currentPositionMm >= maxTravelDistance) {
-        beginStop(STOP_TRAVEL_LIMIT);
-        return;
+      if (manualJogActive) {
+        if (currentPositionMm >= FIRMWARE_MAX_TRAVEL_MM) {
+          immediateStop(STOP_TRAVEL_LIMIT);
+          return;
+        }
+      } else {
+        if (currentPositionMm >= maxTravelDistance) {
+          beginStop(STOP_TRAVEL_LIMIT);
+          return;
+        }
       }
     }
 
@@ -926,20 +955,21 @@ public:
         // Already decelerating — cut power immediately on touch
         finalizeStopAndToggleDirection();
       } else {
-        beginStop(STOP_USER);
+        if (manualJogActive) immediateStop(STOP_USER);
+        else beginStop(STOP_USER);
       }
     }
 
     // State machine
     if (motorState == STARTING) {
-      if (millis() - runStartTime >= safetyMaxRunMs) {
+      if (!manualJogActive && millis() - runStartTime >= safetyMaxRunMs) {
         beginStop(STOP_TIMEOUT);
       } else {
         const unsigned long runElapsed = millis() - runStartTime;
         // During ramp-up, allow some time to avoid false trips before the motor gains momentum.
         // Hard-stop checks remain fully active in RUNNING state.
         if (runElapsed >= stallStartGraceMs && pollCurrentAndCheckSpike()) {
-          immediateStop(STOP_SPIKE, true);
+          immediateStop(STOP_SPIKE, !manualJogActive);
           return;
         }
         updateStartSequence();
@@ -951,26 +981,26 @@ public:
       const unsigned long elapsed = millis() - runStartTime;
 
       // Safety timeout
-      if (elapsed >= safetyMaxRunMs) {
+      if (!manualJogActive && elapsed >= safetyMaxRunMs) {
         beginStop(STOP_TIMEOUT);
         return;
       }
 
       // Target distance reached => smooth auto-stop
-      if (hasReachedTargetDistance()) {
+      if (!manualJogActive && hasReachedTargetDistance()) {
         beginStop(STOP_TARGET_REACHED);
         return;
       }
 
       // Encoder stall detection (Safety Layer 2): no hall tick in stallTimeoutMs
       if (stallDetectionEnabled && (millis() - lastHallTickTime > stallTimeoutMs)) {
-        immediateStop(STOP_STALL, true);
+        immediateStop(STOP_STALL, !manualJogActive);
         return;
       }
 
       // Current spike => immediate hard stop for minimum fault latency.
       if (pollCurrentAndCheckSpike()) {
-        immediateStop(STOP_SPIKE, true);
+        immediateStop(STOP_SPIKE, !manualJogActive);
         return;
       }
 
@@ -1092,20 +1122,20 @@ public:
 
     // Fine control: press-and-hold jog buttons.
     // Press starts movement; release/cancel/leave sends stop.
-    buttonHtml += F(" <button class=\"btn btn-xs\" onpointerdown=\"requestJson({motorController:{open:true}});\" ");
-    buttonHtml += F("onpointerup=\"requestJson({motorController:{stop:true}});\" ");
-    buttonHtml += F("onpointercancel=\"requestJson({motorController:{stop:true}});\" ");
-    buttonHtml += F("onmouseleave=\"requestJson({motorController:{stop:true}});\" ");
-    buttonHtml += F("ontouchend=\"requestJson({motorController:{stop:true}});\">");
-    buttonHtml += F("<i class=\"icons\">&#xe00f;</i> Up");
+    buttonHtml += F(" <button class=\"btn btn-xs\" onpointerdown=\"requestJson({motorController:{jogUp:true}});\" ");
+    buttonHtml += F("onpointerup=\"requestJson({motorController:{jogStop:true}});\" ");
+    buttonHtml += F("onpointercancel=\"requestJson({motorController:{jogStop:true}});\" ");
+    buttonHtml += F("onmouseleave=\"requestJson({motorController:{jogStop:true}});\" ");
+    buttonHtml += F("ontouchend=\"requestJson({motorController:{jogStop:true}});\">");
+    buttonHtml += F("&#8593; Up");
     buttonHtml += F("</button>");
 
-    buttonHtml += F(" <button class=\"btn btn-xs\" onpointerdown=\"requestJson({motorController:{close:true}});\" ");
-    buttonHtml += F("onpointerup=\"requestJson({motorController:{stop:true}});\" ");
-    buttonHtml += F("onpointercancel=\"requestJson({motorController:{stop:true}});\" ");
-    buttonHtml += F("onmouseleave=\"requestJson({motorController:{stop:true}});\" ");
-    buttonHtml += F("ontouchend=\"requestJson({motorController:{stop:true}});\">");
-    buttonHtml += F("<i class=\"icons\">&#xe010;</i> Down");
+    buttonHtml += F(" <button class=\"btn btn-xs\" onpointerdown=\"requestJson({motorController:{jogDown:true}});\" ");
+    buttonHtml += F("onpointerup=\"requestJson({motorController:{jogStop:true}});\" ");
+    buttonHtml += F("onpointercancel=\"requestJson({motorController:{jogStop:true}});\" ");
+    buttonHtml += F("onmouseleave=\"requestJson({motorController:{jogStop:true}});\" ");
+    buttonHtml += F("ontouchend=\"requestJson({motorController:{jogStop:true}});\">");
+    buttonHtml += F("&#8595; Down");
     buttonHtml += F("</button>");
 
     btn.add(buttonHtml);
@@ -1201,7 +1231,20 @@ public:
     }
 
     if (usermod["stop"].as<bool>() && motorState != IDLE) {
-      beginStop(STOP_USER);
+      if (manualJogActive) immediateStop(STOP_USER);
+      else beginStop(STOP_USER);
+    }
+
+    // Manual jog commands from Info UI (press-and-hold controls)
+    if (usermod["jogUp"].as<bool>()) {
+      startManualJog(true);
+    }
+    if (usermod["jogDown"].as<bool>()) {
+      startManualJog(false);
+    }
+    if (usermod["jogStop"].as<bool>() && motorState != IDLE) {
+      if (manualJogActive) immediateStop(STOP_USER);
+      else beginStop(STOP_USER);
     }
 
     // Direction-aware open/close commands
