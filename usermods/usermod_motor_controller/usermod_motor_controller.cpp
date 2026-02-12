@@ -235,6 +235,7 @@ private:
   unsigned long stallTimeoutMs = 150;     // No encoder pulse in this time = stalled (ms)
   unsigned long stallStartGraceMs = 100;  // Grace period after start before stall checks
   unsigned long lastHallTickTime = 0;     // Last time a hall encoder tick was processed
+  bool hallSeenThisRun = false;           // True after first hall tick in current run
 
   // ---------------------------
   // Travel Limits
@@ -589,6 +590,7 @@ private:
     runStartTime = millis();
     spikeSampleCount = 0;
     lastHallTickTime = millis();  // Reset stall timer
+    hallSeenThisRun = false;
 
     // Record starting position for distance tracking
     runStartTicks = positionTicks;
@@ -709,6 +711,7 @@ private:
 
     positionTicks += deltaAccum;
     lastHallTickTime = millis();  // Track for stall detection
+    hallSeenThisRun = true;
 
     const int8_t deltaDir = (deltaAccum > 0) ? 1 : -1;
     const uint8_t deltaMag = (uint8_t)((deltaAccum > 255 || deltaAccum < -255) ? 255 : abs((int)deltaAccum));
@@ -993,9 +996,17 @@ public:
       }
 
       // Encoder stall detection (Safety Layer 2): no hall tick in stallTimeoutMs
-      if (stallDetectionEnabled && (millis() - lastHallTickTime > stallTimeoutMs)) {
-        immediateStop(STOP_STALL, !manualJogActive);
-        return;
+      if (stallDetectionEnabled) {
+        if (!hallSeenThisRun) {
+          // Allow additional startup grace before first encoder pulse.
+          if (elapsed > (accelTimeMs + stallStartGraceMs)) {
+            immediateStop(STOP_STALL, !manualJogActive);
+            return;
+          }
+        } else if (millis() - lastHallTickTime > stallTimeoutMs) {
+          immediateStop(STOP_STALL, !manualJogActive);
+          return;
+        }
       }
 
       // Current spike => immediate hard stop for minimum fault latency.
