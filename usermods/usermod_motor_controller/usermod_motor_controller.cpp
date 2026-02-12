@@ -921,13 +921,9 @@ public:
         beginStop(STOP_TIMEOUT);
       } else {
         const unsigned long runElapsed = millis() - runStartTime;
-        // Fast-fault path: hard stop on encoder stall/current spike even during ramp-up.
-        if (stallDetectionEnabled && runElapsed >= stallStartGraceMs &&
-            (millis() - lastHallTickTime > stallTimeoutMs)) {
-          immediateStop(STOP_STALL, true);
-          return;
-        }
-        if (pollCurrentAndCheckSpike()) {
+        // During ramp-up, allow some time to avoid false trips before the motor gains momentum.
+        // Hard-stop checks remain fully active in RUNNING state.
+        if (runElapsed >= stallStartGraceMs && pollCurrentAndCheckSpike()) {
           immediateStop(STOP_SPIKE, true);
           return;
         }
