@@ -252,6 +252,7 @@ private:
 
   bool motorDirection = true; // true = forward/up, false = reverse/down
   bool manualJogActive = false; // true while UI hold-to-jog controls are active
+  bool homeSeekActive = false;  // true only while explicit HOME command is seeking endstop
   unsigned long runStartTime = 0;
 
   // ramp controller
@@ -522,6 +523,7 @@ private:
       motorDirection = !motorDirection;
     }
     manualJogActive = false;
+    homeSeekActive = false;
 
     publishHomeAssistantSensor();
   }
@@ -555,6 +557,7 @@ private:
     // (e.g., forcing DOWN when unhomed, redirecting at endstop)
     motorDirection = !motorDirection;
     manualJogActive = false;
+    homeSeekActive = false;
 
     spikeSampleCount = 0;
     publishHomeAssistantSensor();
@@ -564,7 +567,7 @@ private:
     // ---------------------------
     // Pre-start safety checks
     // ---------------------------
-    if (endstopEnabled && !manualJogActive) {
+    if (endstopEnabled && !manualJogActive && !homeSeekActive) {
       // If not homed, force direction DOWN to find home first
       if (!isHomed) {
         setDirectionDown();
@@ -630,6 +633,7 @@ private:
       return;
     }
     manualJogActive = true;
+    homeSeekActive = false;
     if (moveUp) setDirectionUp();
     else setDirectionDown();
     beginStart();
@@ -953,6 +957,7 @@ public:
     // Touch toggles start/stop
     if (capTouchPressed()) {
       if (motorState == IDLE) {
+        homeSeekActive = false;
         beginStart();
       } else if (motorState == STOPPING) {
         // Already decelerating — cut power immediately on touch
@@ -992,6 +997,13 @@ public:
       // Target distance reached => smooth auto-stop
       if (!manualJogActive && hasReachedTargetDistance()) {
         beginStop(STOP_TARGET_REACHED);
+        return;
+      }
+
+      // Soft-home floor protection: once homed, normal DOWN moves must not go below 0mm.
+      // Explicit HOME command is allowed to continue down until endstop/stall.
+      if (isHomed && !homeSeekActive && isMovingDown() && currentPositionMm <= 0.0f) {
+        immediateStop(STOP_TARGET_REACHED, !manualJogActive);
         return;
       }
 
@@ -1246,6 +1258,7 @@ public:
 
     // Explicit start/stop commands
     if (usermod["start"].as<bool>() && motorState == IDLE) {
+      homeSeekActive = false;
       beginStart();
     }
 
@@ -1269,11 +1282,13 @@ public:
     // Direction-aware open/close commands
     // Uses ledInvertDirection to determine which physical direction is "open"
     if (usermod["open"].as<bool>() && motorState == IDLE) {
+      homeSeekActive = false;
       motorDirection = !ledInvertDirection;  // Set to opening direction
       beginStart();
     }
 
     if (usermod["close"].as<bool>() && motorState == IDLE) {
+      homeSeekActive = false;
       motorDirection = ledInvertDirection;  // Set to closing direction
       beginStart();
     }
@@ -1289,6 +1304,7 @@ public:
       } else {
         isHomed = false;
         setDirectionDown();
+        homeSeekActive = true;
         beginStart();
       }
     }
@@ -1651,6 +1667,7 @@ public:
       } else if (action == "start" || action == "on") {
         // Start motor in current direction (only if idle)
         if (motorState == IDLE) {
+          homeSeekActive = false;
           beginStart();
         }
         return true;
@@ -1664,6 +1681,7 @@ public:
         // Move in opening direction (uses ledInvertDirection config)
         // ledInvertDirection: false = forward is opening, true = forward is closing
         if (motorState == IDLE) {
+          homeSeekActive = false;
           motorDirection = !ledInvertDirection;  // Set to opening direction
           beginStart();
         }
@@ -1671,6 +1689,7 @@ public:
       } else if (action == "close") {
         // Move in closing direction (uses ledInvertDirection config)
         if (motorState == IDLE) {
+          homeSeekActive = false;
           motorDirection = ledInvertDirection;  // Set to closing direction
           beginStart();
         }
@@ -1687,6 +1706,7 @@ public:
           } else {
             isHomed = false;
             setDirectionDown();
+            homeSeekActive = true;
             beginStart();
           }
         }
