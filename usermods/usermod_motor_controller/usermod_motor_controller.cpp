@@ -42,9 +42,10 @@
 // -----------------------------------------------------------------------------
 // IRAM-safe Hall ISR Globals (free function ISR avoids linker relocation issues)
 // -----------------------------------------------------------------------------
-static volatile bool    g_hallPending    = false;
-static volatile uint8_t g_hallABSnapshot = 0;
 static volatile int8_t  g_hallLastDelta  = 0;  // Last direction detected: +1 forward, -1 reverse, 0 no change
+static volatile int32_t g_hallDeltaAccum = 0;  // Accumulated quadrature deltas from ISR
+static volatile uint8_t g_hallLastAB     = 0;  // Last AB state used by ISR decoder
+static volatile bool    g_hallInit       = false;
 static uint8_t          g_hallAPin       = 32;
 static uint8_t          g_hallBPin       = 35;
 
@@ -57,17 +58,48 @@ static inline uint8_t IRAM_ATTR read_gpio_pin_iram(uint8_t pin) {
 #endif
 
 void IRAM_ATTR hall_isr_capture() {
+  uint8_t ab;
 #if defined(ARDUINO_ARCH_ESP32)
   // Read from low/high GPIO input register based on pin number.
   const uint8_t a = read_gpio_pin_iram(g_hallAPin);
   const uint8_t b = read_gpio_pin_iram(g_hallBPin);
-  g_hallABSnapshot = (a << 1) | b;
-  g_hallPending = true;
+  ab = (a << 1) | b;
 #else
   // Fallback (not IRAM-safe on non-ESP32), but keeps code portable.
-  g_hallABSnapshot = ((uint8_t)digitalRead(g_hallAPin) << 1) | (uint8_t)digitalRead(g_hallBPin);
-  g_hallPending = true;
+  ab = ((uint8_t)digitalRead(g_hallAPin) << 1) | (uint8_t)digitalRead(g_hallBPin);
 #endif
+
+  if (!g_hallInit) {
+    g_hallLastAB = ab;
+    g_hallInit = true;
+    return;
+  }
+
+  // Decode every transition in ISR and accumulate to avoid dropped-edge drift.
+  const uint8_t transition = (uint8_t)((g_hallLastAB << 2) | ab);
+  int8_t delta = 0;
+  switch (transition) {
+    case 0x2:  // 00 -> 10
+    case 0x4:  // 01 -> 00
+    case 0xB:  // 10 -> 11
+    case 0xD:  // 11 -> 01
+      delta = 1;
+      break;
+    case 0x1:  // 00 -> 01
+    case 0x7:  // 01 -> 11
+    case 0x8:  // 10 -> 00
+    case 0xE:  // 11 -> 10
+      delta = -1;
+      break;
+    default:
+      break;
+  }
+
+  g_hallLastAB = ab;
+  if (delta != 0) {
+    g_hallDeltaAccum += delta;
+    g_hallLastDelta = delta;
+  }
 }
 
 // Must be defined BEFORE the class
@@ -165,7 +197,6 @@ private:
   // Position tracking (hall quadrature)
   // ---------------------------
   volatile int32_t positionTicks = 0;
-  uint8_t lastAB = 0;
 
   // Distance configuration
   float ticksPerMm = 1.0f;             // Hall ticks per millimeter
@@ -645,51 +676,37 @@ private:
   // Hall processing (decode in loop)
   // ---------------------------
   void processHallIfPending() {
-    if (!g_hallPending) return;
-
-    uint8_t ab;
+    int32_t deltaAccum = 0;
     noInterrupts();
-    ab = g_hallABSnapshot;
-    g_hallPending = false;
+    deltaAccum = g_hallDeltaAccum;
+    g_hallDeltaAccum = 0;
     interrupts();
 
-    // Quadrature decode table
-    // Maps (lastAB << 2 | currentAB) to direction: +1 forward, -1 reverse, 0 no movement
-    static const int8_t qdec[16] = {
-      0, -1,  1,  0,
-      1,  0,  0, -1,
-     -1,  0,  0,  1,
-      0,  1, -1,  0
-    };
+    if (deltaAccum == 0) return;
 
-    const int8_t delta = qdec[(lastAB << 2) | ab];
-    lastAB = ab;
+    positionTicks += deltaAccum;
+    lastHallTickTime = millis();  // Track for stall detection
 
-    positionTicks += delta;
+    const int8_t deltaDir = (deltaAccum > 0) ? 1 : -1;
+    const uint8_t deltaMag = (uint8_t)((deltaAccum > 255 || deltaAccum < -255) ? 255 : abs((int)deltaAccum));
 
-    // Update detected direction from hall sensors
-    if (delta != 0) {
-      g_hallLastDelta = delta;
-      lastHallTickTime = millis();  // Track for stall detection
+    // Build confidence in detected direction
+    if (deltaDir == detectedDirection) {
+      directionConfidence = (uint8_t)min(255, (int)directionConfidence + (int)deltaMag);
+    } else {
+      directionConfidence = 1;
+      detectedDirection = deltaDir;
+    }
 
-      // Build confidence in detected direction
-      if (delta == detectedDirection) {
-        if (directionConfidence < 255) directionConfidence++;
+    // Update absolute position when homed and motor is active
+    if (isHomed && motorState != IDLE) {
+      const int32_t deltaAbs = (deltaAccum < 0) ? -deltaAccum : deltaAccum;
+      float tickDistanceMm = (float)deltaAbs / ticksPerMm;
+      if (isMovingUp()) {
+        currentPositionMm += tickDistanceMm;
       } else {
-        // Direction changed - update if we see consistent change
-        directionConfidence = 1;
-        detectedDirection = delta;
-      }
-
-      // Update absolute position when homed and motor is active
-      if (isHomed && motorState != IDLE) {
-        float tickDistanceMm = fabsf((float)delta) / ticksPerMm;
-        if (isMovingUp()) {
-          currentPositionMm += tickDistanceMm;
-        } else {
-          currentPositionMm -= tickDistanceMm;
-          if (currentPositionMm < 0.0f) currentPositionMm = 0.0f;
-        }
+        currentPositionMm -= tickDistanceMm;
+        if (currentPositionMm < 0.0f) currentPositionMm = 0.0f;
       }
     }
   }
@@ -789,8 +806,9 @@ public:
     pinMode(hallAPin, INPUT);
     pinMode(hallBPin, INPUT);
 
-    // Initialize lastAB (safe here)
-    lastAB = ((uint8_t)digitalRead(hallAPin) << 1) | (uint8_t)digitalRead(hallBPin);
+    // Initialize ISR quadrature state from current AB levels
+    g_hallLastAB = ((uint8_t)digitalRead(hallAPin) << 1) | (uint8_t)digitalRead(hallBPin);
+    g_hallInit = true;
 
     // Configure ISR globals (must be set before attachInterrupt)
     g_hallAPin = (uint8_t)hallAPin;
