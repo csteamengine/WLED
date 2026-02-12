@@ -1112,22 +1112,30 @@ public:
 
     // Add control buttons
     JsonArray btn = user.createNestedArray(F("Motor Control"));
-    String buttonHtml = F("<button class=\"btn btn-xs\" onclick=\"requestJson({motorController:{toggle:true}});\">");
+    String controlCmd = F("toggle:true");
+    String buttonHtml = F("<button class=\"btn btn-xs\" onclick=\"requestJson({motorController:{");
     if (motorState == IDLE) {
       if (endstopEnabled && !isHomed) {
-        buttonHtml += F("<i class=\"icons off\">&#xe08f;</i> Home");
+        controlCmd = F("home:true");
+        buttonHtml += controlCmd;
+        buttonHtml += F("}});\"><i class=\"icons off\">&#8962;</i> Home");
       } else {
-        buttonHtml += F("<i class=\"icons off\">&#xe08f;</i> Start");
+        // Info-panel Start should always issue opening motion command.
+        controlCmd = F("open:true");
+        buttonHtml += controlCmd;
+        buttonHtml += F("}});\"><i class=\"icons off\">&#xe08f;</i> Start");
       }
     } else {
-      buttonHtml += F("<i class=\"icons on\">&#xe08f;</i> Stop");
+      controlCmd = F("stop:true");
+      buttonHtml += controlCmd;
+      buttonHtml += F("}});\"><i class=\"icons on\">&#xe08f;</i> Stop");
     }
     buttonHtml += F("</button>");
 
     // Add dedicated Home button when endstop is enabled
     if (endstopEnabled) {
       buttonHtml += F(" <button class=\"btn btn-xs\" onclick=\"requestJson({motorController:{home:true}});\">");
-      buttonHtml += F("<i class=\"icons\">&#xe08f;</i> Home");
+      buttonHtml += F("<i class=\"icons\">&#8962;</i> Home");
       buttonHtml += F("</button>");
     }
 
