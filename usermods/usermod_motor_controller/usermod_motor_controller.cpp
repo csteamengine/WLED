@@ -168,7 +168,7 @@ private:
   uint8_t lastAB = 0;
 
   // Distance configuration
-  float distancePerTick = 1.0f;        // Distance units (e.g., mm) per hall sensor tick
+  float ticksPerMm = 1.0f;             // Hall ticks per millimeter
   float targetDistance = 457.2f; // Target distance to travel (default max travel)
   bool  targetDistanceEnabled = true;            // Enable auto-stop at target distance
 
@@ -182,9 +182,6 @@ private:
   // Smoothing for direction detection (consecutive same-direction ticks)
   uint8_t directionConfidence = 0;
   static const uint8_t DIRECTION_CONFIDENCE_THRESHOLD = 2;
-
-  // Legacy alias for backwards compatibility
-  float ticksPerMm = 1.0f; // placeholder (use distancePerTick instead)
 
   // ---------------------------
   // Homing & Absolute Position
@@ -686,7 +683,7 @@ private:
 
       // Update absolute position when homed and motor is active
       if (isHomed && motorState != IDLE) {
-        float tickDistanceMm = fabsf((float)delta * distancePerTick);
+        float tickDistanceMm = fabsf((float)delta) / ticksPerMm;
         if (isMovingUp()) {
           currentPositionMm += tickDistanceMm;
         } else {
@@ -702,7 +699,7 @@ private:
     int32_t ticksDelta = positionTicks - runStartTicks;
     // Use absolute value since we care about distance magnitude
     if (ticksDelta < 0) ticksDelta = -ticksDelta;
-    return (float)ticksDelta * distancePerTick;
+    return (float)ticksDelta / ticksPerMm;
   }
 
   // Check if target distance has been reached
@@ -1115,6 +1112,7 @@ public:
     usermod["hallConfidence"] = directionConfidence;
 
     usermod["posTicks"] = (int32_t)positionTicks;
+    usermod["ticksPerMm"] = ticksPerMm;
     usermod["distance"] = getDistanceTraveled();
     usermod["targetDistance"] = targetDistance;
     usermod["targetEnabled"] = targetDistanceEnabled;
@@ -1164,10 +1162,10 @@ public:
       if (targetDistance > maxTravelDistance) targetDistance = maxTravelDistance;
     }
 
-    // Allow setting distance per tick via API
-    if (!usermod["distancePerTick"].isNull()) {
-      distancePerTick = usermod["distancePerTick"].as<float>();
-      if (distancePerTick <= 0) distancePerTick = 1.0f;
+    // Allow setting ticks per mm via API
+    if (!usermod["ticksPerMm"].isNull()) {
+      ticksPerMm = usermod["ticksPerMm"].as<float>();
+      if (ticksPerMm <= 0) ticksPerMm = 1.0f;
     }
 
     // Toggle (simulates touch sensor press)
@@ -1261,10 +1259,9 @@ public:
     top["maxTravelDistance"] = maxTravelDistance;
 
     // Distance configuration
-    top["distancePerTick"] = distancePerTick;
+    top["ticksPerMm"] = ticksPerMm;
     top["targetDistance"] = targetDistance;
     top["targetDistanceEnabled"] = targetDistanceEnabled;
-    top["ticksPerMm"] = ticksPerMm; // legacy alias
 
     top["accelTime"] = accelTimeMs;
     top["decelTime"] = decelTimeMs;
@@ -1326,7 +1323,6 @@ public:
     maxTravelDistance = FIRMWARE_MAX_TRAVEL_MM;
 
     // Distance defaults
-    distancePerTick = 1.0f;
     targetDistance = FIRMWARE_MAX_TRAVEL_MM;
     targetDistanceEnabled = true;
     ticksPerMm = 1.0f;
@@ -1397,13 +1393,12 @@ public:
     if (maxTravelDistance < 0) maxTravelDistance = 0;
 
     // Distance configuration
-    ok &= getJsonValue(top["distancePerTick"], distancePerTick);
     ok &= getJsonValue(top["targetDistance"], targetDistance);
     ok &= getJsonValue(top["targetDistanceEnabled"], targetDistanceEnabled);
-    ok &= getJsonValue(top["ticksPerMm"], ticksPerMm); // legacy
+    ok &= getJsonValue(top["ticksPerMm"], ticksPerMm);
 
-    // Validate distancePerTick
-    if (distancePerTick <= 0) distancePerTick = 1.0f;
+    // Validate ticksPerMm
+    if (ticksPerMm <= 0) ticksPerMm = 1.0f;
 
     // Clamp target distance to travel limit
     if (targetDistance > maxTravelDistance) targetDistance = maxTravelDistance;
@@ -1498,7 +1493,7 @@ public:
     MCINFO("maxTravelDistance", "mm <i>Max UP travel from home (firmware limit: 457.2mm / 18&quot;)</i>");
 
     // Distance/position settings
-    MCINFO("distancePerTick", "<i>Units traveled per encoder tick (e.g., mm)</i>");
+    MCINFO("ticksPerMm", "<i>Hall ticks per millimeter for distance/position</i>");
     MCINFO("targetDistance", "<i>Auto-stop distance, clamped to max travel (0 = disabled)</i>");
     MCINFO("targetDistanceEnabled", "<i>Enable auto-stop at target distance</i>");
 

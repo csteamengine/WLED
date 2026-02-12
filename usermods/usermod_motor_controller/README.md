@@ -73,7 +73,7 @@ WLED JSON API state fields (write):
 - `resetPos` - reset position to zero
 - `targetDistance` - set target distance
 - `targetEnabled` - enable/disable target distance auto-stop
-- `distancePerTick` - set distance per hall tick
+- `ticksPerMm` - set hall ticks per millimeter
 - `ledControlEnabled` - enable/disable LED control based on lid position
 - `ledInvertDirection` - swap which direction is open vs closed
 
@@ -136,34 +136,34 @@ MQTT telemetry and command support for Home Assistant
 
 ---
 
-## Calibration (Distance per Tick)
+## Calibration (Ticks per mm)
 
 Distance is derived from hall sensor ticks. To calibrate:
 
 1. Reset position to zero via API: `{"motorController": {"resetPos": true}}`
 2. Move actuator a known distance (e.g. 100mm).
 3. Read `posTicks` from JSON state.
-4. Compute distance per tick:
+4. Compute ticks per mm:
 
 ```
-distancePerTick = distance_mm / ticks
+ticksPerMm = ticks / distance_mm
 ```
 
 For example, if 100mm = 12800 ticks:
 ```
-distancePerTick = 100 / 12800 = 0.0078125
+ticksPerMm = 12800 / 100 = 128
 ```
 
 Set this value in WLED config:
 ```json
-"distancePerTick": 0.0078125
+"ticksPerMm": 128
 ```
 
 ## Target Distance Configuration
 
 To make the motor automatically stop after traveling a specific distance:
 
-1. Set `distancePerTick` as described above
+1. Set `ticksPerMm` as described above
 2. Configure the target:
 
 Via WLED Config UI:
