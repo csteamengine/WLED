@@ -879,7 +879,12 @@ public:
     // ---------------------------
     // Travel limit check while motor is running UP
     // ---------------------------
-    if (endstopEnabled && isHomed && motorState != IDLE && isMovingUp()) {
+    // Only trigger travel-limit stop while actively accelerating/running.
+    // If we are already STOPPING, allow the stop sequence to finish;
+    // otherwise we can starve touch handling and never finalize the stop.
+    if (endstopEnabled && isHomed &&
+        (motorState == STARTING || motorState == RUNNING) &&
+        isMovingUp()) {
       if (currentPositionMm >= maxTravelDistance) {
         beginStop(STOP_TRAVEL_LIMIT);
         return;
