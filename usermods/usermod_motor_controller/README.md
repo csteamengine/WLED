@@ -7,7 +7,7 @@ It provides:
 - Capacitive touch start/stop with direction toggle
 - Dual hall-effect sensor position tracking (quadrature)
 - Hall sensor direction detection (determines actual motor spin direction)
-- INA219 current sensing for stall / end-of-travel detection
+- BTS7960 `R_IS`/`L_IS` current sensing via ESP32 ADC
 - Configurable distance per hall tick
 - Configurable target travel distance with auto-stop
 - Automatic stop and direction reversal when endstop is reached
@@ -44,9 +44,9 @@ This allows a single capacitive button to safely drive a linear actuator up and 
 - Useful for detecting slippage or incorrect wiring
 
 ### Current-Based Endstop Detection
-- INA219 high-side current sensor
-- Stall detection by sustained current spike
-- Adjustable threshold and sample count
+- BTS7960 `R_IS` + `L_IS` analog current sense outputs
+- Configurable `isResistorOhms` and `isRatio` calibration
+- Hard-stop on current spike (no decel ramp on fault)
 - Prevents gear damage and motor overheating
 
 ### Integration
@@ -60,7 +60,7 @@ WLED JSON API state fields (read):
 - `distance` - distance traveled in current run (in configured units)
 - `targetDistance` - configured target distance
 - `targetEnabled` - whether target distance auto-stop is enabled
-- `current_mA` - motor current from INA219
+- `current_mA` - motor current estimated from BTS7960 IS pins
 - `pwm` - current PWM duty value
 - `lastStopReason` - "user", "spike", "timeout", or "target"
 
@@ -97,7 +97,8 @@ MQTT telemetry and command support for Home Assistant
 
 ### Sensors
 - 2x Hall effect outputs from actuator (quadrature A/B)
-- INA219 current sensor module (I²C)
+- BTS7960 `R_IS` and `L_IS` connected to ESP32 ADC inputs
+- Bottom endstop switch (recommended NC/NO with pull-up as configured)
 
 ### Controller
 - ESP32 running WLED (GPIO interrupts required)
@@ -112,8 +113,9 @@ MQTT telemetry and command support for Home Assistant
 | Touch Button | GPIO 33 |
 | Hall A | GPIO 32 |
 | Hall B | GPIO 35 |
-| I²C SDA | GPIO 21 |
-| I²C SCL | GPIO 22 |
+| Endstop | GPIO 22 |
+| BTS7960 R_IS | GPIO 39 (ADC1) |
+| BTS7960 L_IS | GPIO 36 (ADC1) |
 
 ---
 
@@ -124,9 +126,9 @@ MQTT telemetry and command support for Home Assistant
    - Acceleration ramp applied
 2. While moving:
    - Hall sensors track position
-   - INA219 monitors motor current
-3. If current spikes (stall / endstop):
-   - Motor stops automatically
+   - BTS7960 IS pins monitor motor current
+3. If hall pulses stop (stall) or current spikes:
+   - Motor hard-stops immediately
    - Direction toggles for next press
 4. Tap while moving:
    - Immediate stop
@@ -208,26 +210,21 @@ Optional kickstart (helps overcome static friction):
 
 Defaults:
 - currentSpikeThresholdmA = 3500.0
-- spikeSamplesRequired = 3
+- currentPollMs = 10
+- spikeSamplesRequired = 1
 
 Tune by:
 - Logging current during free motion
 - Logging during stall
 - Set threshold ~70–80% of stall current
-- Require 2–4 consecutive samples
+- Increase `spikeSamplesRequired` only if noise causes false trips
 
 ---
 
 ## Building (PlatformIO / GitHub Actions)
 
-This usermod requires the following library:
-
-Adafruit INA219
-
-Add to your PlatformIO environment:
-
-lib_deps =
-  adafruit/Adafruit INA219
+No extra external library is required for current sensing.
+This usermod uses ESP32 ADC reads from BTS7960 `R_IS`/`L_IS`.
 
 ---
 
@@ -367,7 +364,7 @@ Set this in WLED web UI under Config > Usermods > MotorController.
 ## Safety Notes
 
 - Always use a motor driver rated well above stall current.
-- INA219 must be wired high-side for accurate PWM current sensing.
+- Wire BTS7960 `R_IS` and `L_IS` to ADC pins with the configured sense resistors to GND (default 4.7kOhm).
 - Do not rely on software only for mechanical safety — physical endstops are still recommended.
 - This system is designed to detect stalls, not prevent all possible damage scenarios.
 

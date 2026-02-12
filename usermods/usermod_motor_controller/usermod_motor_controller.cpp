@@ -48,12 +48,19 @@ static volatile int8_t  g_hallLastDelta  = 0;  // Last direction detected: +1 fo
 static uint8_t          g_hallAPin       = 32;
 static uint8_t          g_hallBPin       = 35;
 
+#if defined(ARDUINO_ARCH_ESP32)
+static inline uint8_t IRAM_ATTR read_gpio_pin_iram(uint8_t pin) {
+  if (pin < 32) return (uint8_t)((GPIO.in >> pin) & 0x1);
+  if (pin < 40) return (uint8_t)((GPIO.in1.data >> (pin - 32)) & 0x1);
+  return 0;
+}
+#endif
+
 void IRAM_ATTR hall_isr_capture() {
 #if defined(ARDUINO_ARCH_ESP32)
-  // GPIO32..39 are read from GPIO.in1.data (bit0 maps to GPIO32)
-  const uint32_t in1 = (uint32_t)GPIO.in1.data;
-  const uint8_t a = (in1 >> (g_hallAPin - 32)) & 0x1;
-  const uint8_t b = (in1 >> (g_hallBPin - 32)) & 0x1;
+  // Read from low/high GPIO input register based on pin number.
+  const uint8_t a = read_gpio_pin_iram(g_hallAPin);
+  const uint8_t b = read_gpio_pin_iram(g_hallBPin);
   g_hallABSnapshot = (a << 1) | b;
   g_hallPending = true;
 #else
@@ -198,6 +205,7 @@ private:
   // ---------------------------
   bool stallDetectionEnabled = true;      // Enable stall detection via encoder timeout
   unsigned long stallTimeoutMs = 150;     // No encoder pulse in this time = stalled (ms)
+  unsigned long stallStartGraceMs = 100;  // Grace period after start before stall checks
   unsigned long lastHallTickTime = 0;     // Last time a hall encoder tick was processed
 
   // ---------------------------
@@ -469,7 +477,7 @@ private:
 
   // Immediate hard stop — cuts power with no deceleration ramp.
   // Used when hitting the endstop (don't keep pushing against physical stop).
-  void immediateStop(StopReason reason) {
+  void immediateStop(StopReason reason, bool toggleDirectionAfter = false) {
     coastMotor();
 
     lastStopReason = reason;
@@ -479,6 +487,10 @@ private:
 
     bool wasOpening = isOpeningDirection(motorDirection);
     updateLedState(wasOpening);
+
+    if (toggleDirectionAfter) {
+      motorDirection = !motorDirection;
+    }
 
     publishHomeAssistantSensor();
   }
@@ -908,6 +920,17 @@ public:
       if (millis() - runStartTime >= safetyMaxRunMs) {
         beginStop(STOP_TIMEOUT);
       } else {
+        const unsigned long runElapsed = millis() - runStartTime;
+        // Fast-fault path: hard stop on encoder stall/current spike even during ramp-up.
+        if (stallDetectionEnabled && runElapsed >= stallStartGraceMs &&
+            (millis() - lastHallTickTime > stallTimeoutMs)) {
+          immediateStop(STOP_STALL, true);
+          return;
+        }
+        if (pollCurrentAndCheckSpike()) {
+          immediateStop(STOP_SPIKE, true);
+          return;
+        }
         updateStartSequence();
       }
       return;
@@ -930,13 +953,13 @@ public:
 
       // Encoder stall detection (Safety Layer 2): no hall tick in stallTimeoutMs
       if (stallDetectionEnabled && (millis() - lastHallTickTime > stallTimeoutMs)) {
-        beginStop(STOP_STALL);
+        immediateStop(STOP_STALL, true);
         return;
       }
 
-      // Current spike => smooth auto-stop (skip ADC reads during strip DMA)
-      if (!strip.isUpdating() && pollCurrentAndCheckSpike()) {
-        beginStop(STOP_SPIKE);
+      // Current spike => immediate hard stop for minimum fault latency.
+      if (pollCurrentAndCheckSpike()) {
+        immediateStop(STOP_SPIKE, true);
         return;
       }
 
@@ -1218,6 +1241,7 @@ public:
     // Stall detection
     top["stallDetectionEnabled"] = stallDetectionEnabled;
     top["stallTimeoutMs"] = stallTimeoutMs;
+    top["stallStartGraceMs"] = stallStartGraceMs;
 
     // Travel limit
     top["maxTravelDistance"] = maxTravelDistance;
@@ -1282,6 +1306,7 @@ public:
     // Stall detection defaults
     stallDetectionEnabled = true;
     stallTimeoutMs = 150;
+    stallStartGraceMs = 100;
 
     // Travel limit default
     maxTravelDistance = FIRMWARE_MAX_TRAVEL_MM;
@@ -1312,9 +1337,9 @@ public:
     currentSenseEnabled = true;
     adcSampleCount = 4;
 
-    currentPollMs = 50;
+    currentPollMs = 10;
     currentSpikeThresholdmA = 3500.0f;
-    spikeSamplesRequired = 3;
+    spikeSamplesRequired = 1;
 
     // LED control defaults
     ledControlEnabled = false;
@@ -1334,6 +1359,8 @@ public:
 
     ok &= getJsonValue(top["hallAPin"], hallAPin);
     ok &= getJsonValue(top["hallBPin"], hallBPin);
+    if (hallAPin < 0 || hallAPin > 39) hallAPin = 32;
+    if (hallBPin < 0 || hallBPin > 39) hallBPin = 35;
 
     // Endstop configuration
     ok &= getJsonValue(top["endstopPin"], endstopPin);
@@ -1348,6 +1375,7 @@ public:
     // Stall detection
     ok &= getJsonValue(top["stallDetectionEnabled"], stallDetectionEnabled);
     ok &= getJsonValue(top["stallTimeoutMs"], stallTimeoutMs);
+    ok &= getJsonValue(top["stallStartGraceMs"], stallStartGraceMs);
 
     // Travel limit (clamped to firmware max)
     ok &= getJsonValue(top["maxTravelDistance"], maxTravelDistance);
@@ -1396,6 +1424,8 @@ public:
     ok &= getJsonValue(top["currentPollMs"], currentPollMs);
     ok &= getJsonValue(top["currentSpikeThresholdmA"], currentSpikeThresholdmA);
     ok &= getJsonValue(top["spikeSamplesRequired"], spikeSamplesRequired);
+    if (currentPollMs < 1) currentPollMs = 1;
+    if (spikeSamplesRequired < 1) spikeSamplesRequired = 1;
 
     // LED control settings
     ok &= getJsonValue(top["ledControlEnabled"], ledControlEnabled);
@@ -1450,6 +1480,7 @@ public:
     // Stall detection
     MCINFO("stallDetectionEnabled", "<i>Stop motor if encoder reports no movement</i>");
     MCINFO("stallTimeoutMs", "ms <i>No encoder pulse for this long = stalled (100-300)</i>");
+    MCINFO("stallStartGraceMs", "ms <i>Grace period after start before stall checks begin</i>");
     MCINFO("maxTravelDistance", "mm <i>Max UP travel from home (firmware limit: 457.2mm / 18&quot;)</i>");
 
     // Distance/position settings
