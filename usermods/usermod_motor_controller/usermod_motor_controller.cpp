@@ -114,7 +114,7 @@ private:
   // ---------------------------
   int8_t rpwmPin = 27;   // BTS7960 RPWM — PWM for extend direction
   int8_t lpwmPin = 14;   // BTS7960 LPWM — PWM for retract direction
-  int8_t renPin  = 12;   // BTS7960 R_EN — enable extend half-bridge
+  int8_t renPin  = 25;   // BTS7960 R_EN — enable extend half-bridge (avoid GPIO12 strapping pin)
   int8_t lenPin  = 13;   // BTS7960 L_EN — enable retract half-bridge
   int8_t touchPin = 33;  // Capacitive touch sensor input (digital HIGH/LOW)
 
@@ -809,11 +809,11 @@ public:
     pinMode(renPin, OUTPUT);
     pinMode(lenPin, OUTPUT);
 
-    // GPIO12 is a strapping pin — must be LOW during/after boot or ESP32 may fail to start.
-    // Explicitly drive enables LOW immediately before any other setup.
+    // If GPIO12 is used as enable pin, keep it LOW at init to reduce strap-related boot issues.
+    // Recommended: use a non-strapping GPIO for renPin (default is GPIO25).
     digitalWrite(renPin, LOW);
     digitalWrite(lenPin, LOW);
-    delay(100);  // Allow strapping pin to stabilize after boot
+    delay(100);
 
     // Touch input
     pinMode(touchPin, INPUT);
@@ -1116,6 +1116,11 @@ public:
       warn.add("DISABLED");
     }
 
+    if (renPin == 12) {
+      JsonArray warn = user.createNestedArray("Pin Warning");
+      warn.add("renPin=GPIO12 can break boot/OTA; use non-strapping pin (e.g. 25)");
+    }
+
     // LED control status
     if (ledControlEnabled) {
       JsonArray ledCtrl = user.createNestedArray("LED Control");
@@ -1393,7 +1398,7 @@ public:
     enabled = true;
     rpwmPin = 27;
     lpwmPin = 14;
-    renPin = 12;
+    renPin = 25;
     lenPin = 13;
     touchPin = 33;
 
