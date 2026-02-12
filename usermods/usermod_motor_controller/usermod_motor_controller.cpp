@@ -643,6 +643,20 @@ private:
     }
   }
 
+  // Shared toggle behavior for capacitive touch and Info panel button.
+  void handleToggleAction() {
+    if (motorState == IDLE) {
+      homeSeekActive = false;
+      beginStart();
+    } else if (motorState == STOPPING) {
+      // Already decelerating — cut power immediately on second press.
+      finalizeStopAndToggleDirection();
+    } else {
+      if (manualJogActive) immediateStop(STOP_USER);
+      else beginStop(STOP_USER);
+    }
+  }
+
   void updateStartSequence() {
     const unsigned long now = millis();
     const unsigned long elapsed = now - rampStartTime;
@@ -956,16 +970,7 @@ public:
 
     // Touch toggles start/stop
     if (capTouchPressed()) {
-      if (motorState == IDLE) {
-        homeSeekActive = false;
-        beginStart();
-      } else if (motorState == STOPPING) {
-        // Already decelerating — cut power immediately on touch
-        finalizeStopAndToggleDirection();
-      } else {
-        if (manualJogActive) immediateStop(STOP_USER);
-        else beginStop(STOP_USER);
-      }
+      handleToggleAction();
     }
 
     // State machine
@@ -1129,23 +1134,15 @@ public:
 
     // Add control buttons
     JsonArray btn = user.createNestedArray(F("Motor Control"));
-    String controlCmd = F("toggle:true");
-    String buttonHtml = F("<button class=\"btn btn-xs\" onclick=\"requestJson({motorController:{");
+    String buttonHtml = F("<button class=\"btn btn-xs\" onclick=\"requestJson({motorController:{panelToggle:true}});\">");
     if (motorState == IDLE) {
       if (endstopEnabled && !isHomed) {
-        controlCmd = F("home:true");
-        buttonHtml += controlCmd;
-        buttonHtml += F("}});\"><i class=\"icons off\">&#8962;</i> Home");
+        buttonHtml += F("<i class=\"icons off\">&#8962;</i> Home");
       } else {
-        // Info-panel Start should always issue opening motion command.
-        controlCmd = F("open:true");
-        buttonHtml += controlCmd;
-        buttonHtml += F("}});\"><i class=\"icons off\">&#xe08f;</i> Start");
+        buttonHtml += F("<i class=\"icons off\">&#xe08f;</i> Start");
       }
     } else {
-      controlCmd = F("stop:true");
-      buttonHtml += controlCmd;
-      buttonHtml += F("}});\"><i class=\"icons on\">&#xe08f;</i> Stop");
+      buttonHtml += F("<i class=\"icons on\">&#xe08f;</i> Stop");
     }
     buttonHtml += F("</button>");
 
@@ -1254,11 +1251,12 @@ public:
 
     // Toggle (simulates touch sensor press)
     if (usermod["toggle"].as<bool>()) {
-      if (motorState == IDLE) {
-        beginStart();
-      } else {
-        beginStop(STOP_USER);
-      }
+      handleToggleAction();
+    }
+
+    // Info panel main button
+    if (usermod["panelToggle"].as<bool>()) {
+      handleToggleAction();
     }
 
     // Explicit start/stop commands
