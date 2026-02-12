@@ -200,7 +200,7 @@ Configuration:
 - `pwmMax` - target PWM value (default: 255)
 
 Optional kickstart (helps overcome static friction):
-- `kickstartEnabled` - enable kickstart pulse (default: true)
+- `kickstartEnabled` - enable kickstart pulse (default: false)
 - `kickstartPwm` - PWM value for kickstart (default: 255)
 - `kickstartMs` - duration of kickstart in ms (default: 120ms)
 

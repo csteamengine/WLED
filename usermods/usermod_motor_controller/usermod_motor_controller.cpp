@@ -169,8 +169,8 @@ private:
 
   // Distance configuration
   float distancePerTick = 1.0f;        // Distance units (e.g., mm) per hall sensor tick
-  float targetDistance = 0.0f;         // Target distance to travel (0 = unlimited/manual stop)
-  bool  targetDistanceEnabled = false; // Enable auto-stop at target distance
+  float targetDistance = 457.2f; // Target distance to travel (default max travel)
+  bool  targetDistanceEnabled = true;            // Enable auto-stop at target distance
 
   // Starting position for current run (to calculate distance traveled)
   int32_t runStartTicks = 0;
@@ -250,7 +250,7 @@ private:
   // ---------------------------
   // LED Control (based on lid state)
   // ---------------------------
-  bool ledControlEnabled = false;    // Enable LED on/off based on motor direction
+  bool ledControlEnabled = true;     // Enable LED on/off based on motor direction
   bool ledInvertDirection = false;   // false: forward=opening (LEDs on), true: forward=closing (LEDs off)
   uint8_t ledSavedBri = 128;         // Saved brightness to restore when turning LEDs back on
 
@@ -1079,6 +1079,24 @@ public:
       buttonHtml += F("</button>");
     }
 
+    // Fine control: press-and-hold jog buttons.
+    // Press starts movement; release/cancel/leave sends stop.
+    buttonHtml += F(" <button class=\"btn btn-xs\" onpointerdown=\"requestJson({motorController:{open:true}});\" ");
+    buttonHtml += F("onpointerup=\"requestJson({motorController:{stop:true}});\" ");
+    buttonHtml += F("onpointercancel=\"requestJson({motorController:{stop:true}});\" ");
+    buttonHtml += F("onmouseleave=\"requestJson({motorController:{stop:true}});\" ");
+    buttonHtml += F("ontouchend=\"requestJson({motorController:{stop:true}});\">");
+    buttonHtml += F("<i class=\"icons\">&#xe00f;</i> Up");
+    buttonHtml += F("</button>");
+
+    buttonHtml += F(" <button class=\"btn btn-xs\" onpointerdown=\"requestJson({motorController:{close:true}});\" ");
+    buttonHtml += F("onpointerup=\"requestJson({motorController:{stop:true}});\" ");
+    buttonHtml += F("onpointercancel=\"requestJson({motorController:{stop:true}});\" ");
+    buttonHtml += F("onmouseleave=\"requestJson({motorController:{stop:true}});\" ");
+    buttonHtml += F("ontouchend=\"requestJson({motorController:{stop:true}});\">");
+    buttonHtml += F("<i class=\"icons\">&#xe010;</i> Down");
+    buttonHtml += F("</button>");
+
     btn.add(buttonHtml);
     if (endstopEnabled && !isHomed) {
       btn.add(F(" (Needs homing)"));
@@ -1313,8 +1331,8 @@ public:
 
     // Distance defaults
     distancePerTick = 1.0f;
-    targetDistance = 0.0f;
-    targetDistanceEnabled = false;
+    targetDistance = FIRMWARE_MAX_TRAVEL_MM;
+    targetDistanceEnabled = true;
     ticksPerMm = 1.0f;
 
     accelTimeMs = 800;
@@ -1342,7 +1360,7 @@ public:
     spikeSamplesRequired = 1;
 
     // LED control defaults
-    ledControlEnabled = false;
+    ledControlEnabled = true;
     ledInvertDirection = false;
 
     JsonObject top = root["MotorController"];
