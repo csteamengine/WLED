@@ -17,6 +17,10 @@ This allows a single capacitive button to safely drive a linear actuator up and 
 
 ---
 
+> **Disclaimer:** This project involves DIY electronics and high-current motor control. Working with electrical components carries inherent risks, including but not limited to electrical shock, fire, and mechanical injury. This software and documentation are provided "as is" without any warranty of any kind. The author assumes no liability for any damage to property, personal injury, or other harm resulting from the use or misuse of this project. It is your responsibility to ensure that your build meets all applicable safety standards and local regulations. If you are not experienced with electronics, please seek guidance from a qualified professional.
+
+---
+
 ## Features
 
 ### Motion Control
