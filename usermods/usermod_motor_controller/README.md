@@ -13,7 +13,7 @@ It provides:
 - Automatic stop and direction reversal when endstop is reached
 - Position, distance, and current reporting via WLED JSON API and MQTT
 
-This allows a single capacitive button to safely drive a linear actuator up and down while automatically stopping when mechanical limits are reached.
+This allows a single capacdsitive button to safely drive a linear actuator up and down while automatically stopping when mechanical limits are reached.
 
 ---
 

@@ -4,12 +4,12 @@
 /*
  * Motor Controller Usermod (WLED)
  * - BTS7960 dual half-bridge motor driver (RPWM/LPWM + R_EN/L_EN)
- * - Capacitive touch start/stop toggle
+ * - Momentary button start/stop toggle (to GND, internal pull-up)
  * - Quadrature hall sensors for position tracking & direction detection
  * - BTS7960 IS pin current sensing to detect stall/endstop by current spike
  * - Configurable target travel distance with auto-stop
  * - Bottom endstop switch for homing & absolute position tracking
- * - Firmware travel limit (18" / 457.2mm) to protect linear actuator stroke
+ * - Firmware travel limit (30" / 762mm) to protect linear actuator stroke
  * - Homing sequence: motor must find bottom endstop before allowing upward travel
  * - Safe boot: motor never moves automatically on power-up
  *
@@ -48,6 +48,20 @@ static volatile uint8_t g_hallLastAB     = 0;  // Last AB state used by ISR deco
 static volatile bool    g_hallInit       = false;
 static uint8_t          g_hallAPin       = 32;
 static uint8_t          g_hallBPin       = 35;
+
+// -----------------------------------------------------------------------------
+// IRAM-safe Endstop ISR Globals
+// When the endstop fires, the ISR immediately kills PWM (zero latency)
+// and sets a flag for loop() to handle state-machine cleanup.
+// -----------------------------------------------------------------------------
+static volatile bool g_endstopISRFired   = false;  // Set by ISR, cleared by loop()
+static volatile bool g_endstopMotorArmed = false;   // true when motor is moving down (loop sets this)
+static bool          g_endstopActiveLow  = true;
+static uint8_t       g_endstopPin        = 22;
+static uint8_t       g_rpwmChannel       = 4;
+static uint8_t       g_lpwmChannel       = 5;
+static uint8_t       g_renPin            = 25;
+static uint8_t       g_lenPin            = 13;
 
 #if defined(ARDUINO_ARCH_ESP32)
 static inline uint8_t IRAM_ATTR read_gpio_pin_iram(uint8_t pin) {
@@ -102,6 +116,32 @@ void IRAM_ATTR hall_isr_capture() {
   }
 }
 
+// Endstop ISR: immediately kills motor PWM when endstop triggers.
+// State-machine cleanup happens in loop() when it sees g_endstopISRFired.
+void IRAM_ATTR endstop_isr_handler() {
+  // Read pin via register for IRAM safety
+  bool triggered;
+#if defined(ARDUINO_ARCH_ESP32)
+  uint8_t level = read_gpio_pin_iram(g_endstopPin);
+  triggered = g_endstopActiveLow ? (level == 0) : (level != 0);
+#else
+  triggered = digitalRead(g_endstopPin) == (g_endstopActiveLow ? LOW : HIGH);
+#endif
+
+  if (triggered && g_endstopMotorArmed) {
+    // Kill PWM and active brake — zero latency motor stop.
+    // Keep enables HIGH to short the motor for regenerative braking.
+#if defined(ARDUINO_ARCH_ESP32)
+    ledcWrite(g_rpwmChannel, 0);
+    ledcWrite(g_lpwmChannel, 0);
+#endif
+    digitalWrite(g_renPin, HIGH);
+    digitalWrite(g_lenPin, HIGH);
+    g_endstopMotorArmed = false;
+    g_endstopISRFired = true;
+  }
+}
+
 // Must be defined BEFORE the class
 #ifndef USERMOD_ID_MOTOR_CONTROLLER
 #define USERMOD_ID_MOTOR_CONTROLLER 9042
@@ -116,13 +156,14 @@ private:
   int8_t lpwmPin = 14;   // BTS7960 LPWM — PWM for retract direction
   int8_t renPin  = 25;   // BTS7960 R_EN — enable extend half-bridge (avoid GPIO12 strapping pin)
   int8_t lenPin  = 13;   // BTS7960 L_EN — enable retract half-bridge
-  int8_t touchPin = 33;  // Capacitive touch sensor input (digital HIGH/LOW)
+  int8_t buttonPin = 33;  // Momentary button input (to GND, internal pull-up)
 
   // Bottom endstop switch
   int8_t endstopPin = 22;          // Endstop input
   bool   endstopActiveLow = true;  // true = LOW when triggered (pull-up + NO switch to GND)
   bool   endstopEnabled = true;    // Enable endstop functionality
   unsigned long endstopDebounceMs = 20;  // Debounce time for mechanical switch (ms)
+  float bottomApproachMm = 50.0f;        // Start decelerating this far above bottom (mm)
   unsigned long lastEndstopChangeTime = 0;  // Last time raw endstop reading changed
   bool debouncedEndstopState = false;       // Debounced endstop triggered state
   bool lastRawEndstopState = false;         // Previous raw reading for edge detection
@@ -138,7 +179,7 @@ private:
   // ---------------------------
   // Timing / Motion Parameters
   // ---------------------------
-  unsigned long accelTimeMs = 800;
+  unsigned long accelTimeMs = 1500;
   unsigned long decelTimeMs = 800;
 
   // Run until spike OR user stops, but keep a safety timeout
@@ -165,11 +206,10 @@ private:
   unsigned long kickstartMs = 120;
 
   // ---------------------------
-  // Touch detection (noise immunity)
+  // Button debounce
   // ---------------------------
-  unsigned long capDebounceMs = 80;
-  int touchSamples = 5;
-  unsigned long touchLockoutMs = 300;
+  unsigned long buttonDebounceMs = 80;
+  unsigned long buttonLockoutMs = 300;
 
   // ---------------------------
   // Current sensing (BTS7960 IS pins via ADC)
@@ -240,9 +280,10 @@ private:
   // ---------------------------
   // Travel Limits
   // ---------------------------
-  // 18 inches = 457.2mm — firmware hard limit (actuator has 35" stroke, this keeps well within)
-  static constexpr float FIRMWARE_MAX_TRAVEL_MM = 457.2f;
-  float maxTravelDistance = 457.2f;  // User-adjustable max travel, clamped to firmware limit
+  // 30 inches = 762.0mm — firmware hard limit (actuator has 35" stroke, leave margin
+  // since "Set Bottom" may not be at 0" extended)
+  static constexpr float FIRMWARE_MAX_TRAVEL_MM = 762.0f;
+  float maxTravelDistance = 762.0f;  // User-adjustable max travel, clamped to firmware limit
 
   // ---------------------------
   // Motor Motion State Machine
@@ -251,6 +292,7 @@ private:
   MotorState motorState = IDLE;
 
   bool motorDirection = true; // true = forward/up, false = reverse/down
+  bool lastActiveMovingDown = false; // Snapshot of isMovingDown() before direction toggle (for coast tracking)
   bool manualJogActive = false; // true while UI hold-to-jog controls are active
   bool homeSeekActive = false;  // true only while explicit HOME command is seeking endstop
   unsigned long runStartTime = 0;
@@ -268,11 +310,10 @@ private:
   enum StopReason { STOP_USER, STOP_SPIKE, STOP_TIMEOUT, STOP_TARGET_REACHED, STOP_ENDSTOP, STOP_TRAVEL_LIMIT, STOP_STALL };
   StopReason lastStopReason = STOP_USER;
 
-  // Touch detection state
-  int touchSampleCount = 0;
-  bool touchDetected = false;
-  unsigned long lastTouchTime = 0;
-  unsigned long touchStartTime = 0;
+  // Button detection state
+  bool buttonDetected = false;
+  unsigned long lastButtonTime = 0;
+  unsigned long buttonStartTime = 0;
 
   // Enable/disable usermod
   bool enabled = true;
@@ -416,6 +457,7 @@ private:
 
   // Cut all motor outputs (both PWM channels to 0, disable half-bridges)
   void coastMotor() {
+    g_endstopMotorArmed = false;  // Disarm ISR before touching hardware
 #if defined(ARDUINO_ARCH_ESP32)
     ledcWrite(pwmChannelR, 0);
     ledcWrite(pwmChannelL, 0);
@@ -426,6 +468,25 @@ private:
     currentPwm = 0;
     digitalWrite(renPin, LOW);
     digitalWrite(lenPin, LOW);
+  }
+
+  // Active brake: PWM channels to 0 but keeps both half-bridges ENABLED.
+  // This shorts the motor windings through the low-side FETs, converting
+  // kinetic energy to heat and stopping the motor much faster than coasting.
+  // Essential for gravity-assisted loads where coasting = freewheeling downward.
+  void brakeMotor() {
+    g_endstopMotorArmed = false;
+#if defined(ARDUINO_ARCH_ESP32)
+    ledcWrite(pwmChannelR, 0);
+    ledcWrite(pwmChannelL, 0);
+#else
+    analogWrite(rpwmPin, 0);
+    analogWrite(lpwmPin, 0);
+#endif
+    currentPwm = 0;
+    // Keep enables HIGH — this shorts the motor for regenerative braking
+    digitalWrite(renPin, HIGH);
+    digitalWrite(lenPin, HIGH);
   }
 
   // Enable both half-bridges (call before applying PWM)
@@ -475,7 +536,10 @@ private:
     return debouncedEndstopState;
   }
 
-  // Update debounced endstop reading — must be called every loop iteration
+  // Update debounced endstop reading — must be called every loop iteration.
+  // Uses "instant trigger, delayed release" pattern: the endstop registers
+  // immediately on first activation (safety-critical), but requires the full
+  // debounce period of stable "open" readings before it clears.
   void updateEndstopDebounce() {
     if (!endstopEnabled) return;
     bool rawState = digitalRead(endstopPin) == (endstopActiveLow ? LOW : HIGH);
@@ -483,8 +547,14 @@ private:
       lastRawEndstopState = rawState;
       lastEndstopChangeTime = millis();
     }
-    if (millis() - lastEndstopChangeTime >= endstopDebounceMs) {
-      debouncedEndstopState = lastRawEndstopState;
+    if (rawState && !debouncedEndstopState) {
+      // Trigger immediately on activation — no delay
+      debouncedEndstopState = true;
+    } else if (!rawState && debouncedEndstopState) {
+      // Only release after stable "open" for the full debounce period
+      if (millis() - lastEndstopChangeTime >= endstopDebounceMs) {
+        debouncedEndstopState = false;
+      }
     }
   }
 
@@ -509,9 +579,10 @@ private:
   // Immediate hard stop — cuts power with no deceleration ramp.
   // Used when hitting the endstop (don't keep pushing against physical stop).
   void immediateStop(StopReason reason, bool toggleDirectionAfter = false) {
-    coastMotor();
+    brakeMotor();
 
     lastStopReason = reason;
+    lastActiveMovingDown = isMovingDown();  // Save before toggle/IDLE for coast tracking
     motorState = IDLE;
     kickActive = false;
     spikeSampleCount = 0;
@@ -545,6 +616,9 @@ private:
     // Coast — disable both half-bridges
     coastMotor();
 
+    // Save direction before toggle so coast-down ticks are tracked correctly
+    lastActiveMovingDown = isMovingDown();
+
     // Update LED state based on the direction we just finished
     // If we were opening (moving in opening direction), lid is now open -> LEDs ON
     // If we were closing (moving in closing direction), lid is now closed -> LEDs OFF
@@ -567,14 +641,9 @@ private:
     // ---------------------------
     // Pre-start safety checks
     // ---------------------------
-    if (endstopEnabled && !manualJogActive && !homeSeekActive) {
-      // If not homed, force direction DOWN to find home first
-      if (!isHomed) {
-        setDirectionDown();
-      }
-
+    if (endstopEnabled && !manualJogActive) {
       // If trying to go DOWN but endstop is already triggered,
-      // redirect to UP and continue (don't silently consume the touch press)
+      // redirect to UP and continue (don't silently consume the button press)
       if (isMovingDown() && isEndstopTriggered()) {
         isHomed = true;
         currentPositionMm = 0.0f;
@@ -605,6 +674,11 @@ private:
     // Enable BTS7960 half-bridges and set direction (PWM routing)
     enableMotorDriver();
     setDirectionPins(motorDirection);
+
+    // Arm endstop ISR for immediate hardware-level stop when moving down
+    if (endstopEnabled && isMovingDown()) {
+      g_endstopMotorArmed = true;
+    }
 
     // If we're starting to open the lid, turn LEDs on immediately
     if (isOpeningDirection(motorDirection)) {
@@ -643,7 +717,7 @@ private:
     }
   }
 
-  // Shared toggle behavior for capacitive touch and Info panel button.
+  // Shared toggle behavior for physical button and Info panel button.
   void handleToggleAction() {
     if (motorState == IDLE) {
       homeSeekActive = false;
@@ -674,7 +748,20 @@ private:
     const unsigned long now = millis();
     const unsigned long elapsed = now - rampStartTime;
 
-    const int pwm = computeRampPwm(elapsed, decelTimeMs, rampStartPwm, 0);
+    int pwm = computeRampPwm(elapsed, decelTimeMs, rampStartPwm, 0);
+
+    // When decelerating toward bottom, cap PWM to the approach zone limit.
+    // This ensures the motor is near-zero speed when it reaches 0mm,
+    // minimizing coast-down after the hard floor immediateStop.
+    if (isHomed && !homeSeekActive && !manualJogActive &&
+        isMovingDown() && bottomApproachMm > 0.0f &&
+        currentPositionMm <= bottomApproachMm && currentPositionMm > 0.0f) {
+      float fraction = currentPositionMm / bottomApproachMm;
+      int approachPwm = pwmMin + (int)((float)(pwmMax - pwmMin) * fraction);
+      if (approachPwm < pwmMin) approachPwm = pwmMin;
+      if (pwm > approachPwm) pwm = approachPwm;
+    }
+
     applyPwm(pwm);
 
     if (elapsed >= decelTimeMs) {
@@ -683,33 +770,31 @@ private:
   }
 
   // ---------------------------
-  // Touch detection
+  // Button detection
   // ---------------------------
-  bool capTouchPressed() {
+  bool buttonPressed() {
     const unsigned long now = millis();
 
     // Lockout prevents rapid re-triggers after a confirmed press
-    if (now - lastTouchTime < touchLockoutMs) return false;
+    if (now - lastButtonTime < buttonLockoutMs) return false;
 
-    const bool reading = digitalRead(touchPin) == HIGH;
+    const bool pressed = digitalRead(buttonPin) == LOW;  // Active LOW (pull-up to GND)
 
-    if (reading) {
-      if (touchSampleCount == 0) {
-        // First HIGH reading — start debounce timer
-        touchStartTime = now;
-        touchSampleCount = 1;
+    if (pressed) {
+      if (!buttonDetected) {
+        // First LOW reading — start debounce timer
+        buttonStartTime = now;
+        buttonDetected = true;
       }
-      // Signal has been continuously HIGH since touchStartTime
-      if (!touchDetected && (now - touchStartTime >= capDebounceMs)) {
-        // Stable HIGH for capDebounceMs — confirmed press
-        touchDetected = true;
-        lastTouchTime = now;
+      if (now - buttonStartTime >= buttonDebounceMs) {
+        // Stable LOW for buttonDebounceMs — confirmed press
+        lastButtonTime = now;
+        buttonDetected = false;
         return true;
       }
     } else {
-      // Signal LOW — reset detection state
-      touchDetected = false;
-      touchSampleCount = 0;
+      // Button released — reset detection state
+      buttonDetected = false;
     }
 
     return false;
@@ -742,16 +827,22 @@ private:
       detectedDirection = deltaDir;
     }
 
-    // Update absolute position when homed and motor is active
-    if (isHomed && motorState != IDLE) {
+    // Update absolute position when homed.
+    // Track during ALL states including IDLE so that coast-down ticks after
+    // an immediate stop are captured — prevents cumulative drift.
+    // During active states: use commanded direction (known to be correct).
+    // During IDLE: use lastActiveMovingDown (saved before direction toggle)
+    //   so coast-down ticks are applied in the correct direction.
+    if (isHomed) {
       const int32_t deltaAbs = (deltaAccum < 0) ? -deltaAccum : deltaAccum;
       float tickDistanceMm = (float)deltaAbs / ticksPerMm;
-      if (isMovingUp()) {
-        currentPositionMm += tickDistanceMm;
-      } else {
+      bool movingDown = (motorState != IDLE) ? isMovingDown() : lastActiveMovingDown;
+      if (movingDown) {
         currentPositionMm -= tickDistanceMm;
-        if (currentPositionMm < 0.0f) currentPositionMm = 0.0f;
+      } else {
+        currentPositionMm += tickDistanceMm;
       }
+      if (currentPositionMm < 0.0f) currentPositionMm = 0.0f;
     }
   }
 
@@ -829,8 +920,12 @@ public:
     digitalWrite(lenPin, LOW);
     delay(100);
 
-    // Touch input
-    pinMode(touchPin, INPUT);
+    // Button input (momentary switch to GND, internal pull-up)
+    if (buttonPin >= 34 && buttonPin <= 39) {
+      pinMode(buttonPin, INPUT);       // No internal pull-up available; needs external
+    } else {
+      pinMode(buttonPin, INPUT_PULLUP);
+    }
 
     // Endstop input (GPIO 34-39 don't have internal pull-ups on ESP32)
     if (endstopEnabled) {
@@ -844,6 +939,18 @@ public:
       debouncedEndstopState = rawState;
       lastRawEndstopState = rawState;
       lastEndstopChangeTime = millis();
+
+      // Configure endstop ISR globals and attach hardware interrupt
+      g_endstopPin = (uint8_t)endstopPin;
+      g_endstopActiveLow = endstopActiveLow;
+      g_rpwmChannel = (uint8_t)pwmChannelR;
+      g_lpwmChannel = (uint8_t)pwmChannelL;
+      g_renPin = (uint8_t)renPin;
+      g_lenPin = (uint8_t)lenPin;
+      g_endstopMotorArmed = false;
+      g_endstopISRFired = false;
+      attachInterrupt(digitalPinToInterrupt(endstopPin), endstop_isr_handler,
+                      endstopActiveLow ? FALLING : RISING);
     }
 
     // Hall inputs (no internal pullup — HE sensor board provides external pullups)
@@ -896,12 +1003,11 @@ public:
         // Lid is closed/down — LEDs should be OFF
         updateLedState(false);
       } else {
-        // Endstop NOT triggered — position is unknown, needs homing.
-        // First user-initiated movement will go DOWN to find home.
+        // Endstop NOT triggered — position is unknown.
+        // User must jog to desired bottom and press "Set Bottom" to home.
         // Motor will NOT move automatically (safety: prevent pinch on power-up).
         isHomed = false;
         currentPositionMm = 0.0f;
-        setDirectionDown();  // Force first movement toward endstop
         // Position unknown — default LEDs OFF for safety
         updateLedState(false);
       }
@@ -914,7 +1020,7 @@ public:
     if (!enabled || !initDone) return;
 
     // Motor control must run every iteration regardless of strip updates.
-    // GPIO reads, PWM writes, and touch detection are safe during DMA.
+    // GPIO reads, PWM writes, and button detection are safe during DMA.
 
     // Process hall updates frequently
     processHallIfPending();
@@ -926,9 +1032,33 @@ public:
     // Endstop monitoring (every loop iteration for safety)
     // ---------------------------
     if (endstopEnabled) {
+      // Check if the hardware ISR already killed the motor (fires within microseconds
+      // of endstop contact, independent of loop() timing).  We just do cleanup here.
+      if (g_endstopISRFired) {
+        g_endstopISRFired = false;
+        // Motor power is already cut by ISR — just sync the state machine
+        lastStopReason = STOP_ENDSTOP;
+        lastActiveMovingDown = isMovingDown();
+        motorState = IDLE;
+        kickActive = false;
+        spikeSampleCount = 0;
+        currentPwm = 0;
+        manualJogActive = false;
+        homeSeekActive = false;
+        isHomed = true;
+        currentPositionMm = 0.0f;
+        positionTicks = 0;
+        setDirectionUp();
+        bool wasOpening = isOpeningDirection(motorDirection);
+        updateLedState(wasOpening);
+        publishHomeAssistantSensor();
+        return;
+      }
+
       bool endstopHit = isEndstopTriggered();
 
-      // If endstop triggers while motor is moving DOWN — IMMEDIATE stop
+      // Polled fallback: if endstop triggers while motor is moving DOWN — IMMEDIATE stop
+      // (covers edge cases where ISR might not be armed, e.g. direction change mid-run)
       if (endstopHit && motorState != IDLE && isMovingDown()) {
         immediateStop(STOP_ENDSTOP);
         isHomed = true;
@@ -968,8 +1098,8 @@ public:
       }
     }
 
-    // Touch toggles start/stop
-    if (capTouchPressed()) {
+    // Button toggles start/stop
+    if (buttonPressed()) {
       handleToggleAction();
     }
 
@@ -1005,10 +1135,26 @@ public:
         return;
       }
 
-      // Soft-home floor protection: once homed, normal DOWN moves must not go below 0mm.
-      // Explicit HOME command is allowed to continue down until endstop/stall.
-      if (isHomed && !homeSeekActive && isMovingDown() && currentPositionMm <= 0.0f) {
-        immediateStop(STOP_TARGET_REACHED, !manualJogActive);
+      // Hard floor: bottom is a physical stop — immediate power cut at 0mm.
+      if (isHomed && !homeSeekActive && !manualJogActive &&
+          isMovingDown() && currentPositionMm <= 0.0f) {
+        immediateStop(STOP_TARGET_REACHED, true);
+        currentPositionMm = 0.0f;
+        return;
+      }
+
+      // Bottom approach: proportionally reduce speed as the motor nears 0mm.
+      // Motor keeps moving (no state change) but arrives at low speed so the
+      // hard floor stop is gentle.  Returns early to prevent the default
+      // applyPwm(currentPwm) at the end of RUNNING from overwriting.
+      if (isHomed && !homeSeekActive && !manualJogActive &&
+          isMovingDown() && bottomApproachMm > 0.0f &&
+          currentPositionMm <= bottomApproachMm) {
+        float fraction = currentPositionMm / bottomApproachMm; // 1.0 at edge, 0.0 at bottom
+        int approachPwm = pwmMin + (int)((float)(pwmMax - pwmMin) * fraction);
+        if (approachPwm < pwmMin) approachPwm = pwmMin;
+        setDirectionPins(motorDirection);
+        applyPwm(approachPwm);
         return;
       }
 
@@ -1040,6 +1186,15 @@ public:
     }
 
     if (motorState == STOPPING) {
+      // Hard floor applies during decel too — if the motor is decelerating
+      // toward 0mm, cut power the moment it arrives.  Without this, the decel
+      // ramp lets the motor coast past 0mm causing cumulative drift.
+      if (isHomed && !homeSeekActive && !manualJogActive &&
+          isMovingDown() && currentPositionMm <= 0.0f) {
+        immediateStop(STOP_TARGET_REACHED, true);
+        currentPositionMm = 0.0f;
+        return;
+      }
       updateStopSequence();
       return;
     }
@@ -1060,20 +1215,20 @@ public:
     motorStatus.add(st);
     motorStatus.add(motorDirection ? "Forward" : "Reverse");
 
-    // Homing / endstop status
-    if (endstopEnabled) {
-      JsonArray homeStatus = user.createNestedArray("Homed");
-      homeStatus.add(isHomed ? "Yes" : "NO - press button to home");
+    // Homing / position status
+    JsonArray homeStatus = user.createNestedArray("Bottom Set");
+    homeStatus.add(isHomed ? "Yes" : "NO - jog to position & press Set Bottom");
 
+    if (endstopEnabled) {
       JsonArray endstopStatus = user.createNestedArray("Endstop");
       endstopStatus.add(isEndstopTriggered() ? "TRIGGERED" : "Open");
+    }
 
-      if (isHomed) {
-        JsonArray absPos = user.createNestedArray("Position (mm)");
-        absPos.add(currentPositionMm);
-        absPos.add(" / ");
-        absPos.add(maxTravelDistance);
-      }
+    if (isHomed) {
+      JsonArray absPos = user.createNestedArray("Position (mm)");
+      absPos.add(currentPositionMm);
+      absPos.add(" / ");
+      absPos.add(maxTravelDistance);
     }
 
     // Show detected direction from hall sensors (actual spin direction)
@@ -1136,22 +1291,16 @@ public:
     JsonArray btn = user.createNestedArray(F("Motor Control"));
     String buttonHtml = F("<button class=\"btn btn-xs\" onclick=\"requestJson({motorController:{panelToggle:true}});\">");
     if (motorState == IDLE) {
-      if (endstopEnabled && !isHomed) {
-        buttonHtml += F("<i class=\"icons off\">&#8962;</i> Home");
-      } else {
-        buttonHtml += F("<i class=\"icons off\">&#xe08f;</i> Start");
-      }
+      buttonHtml += F("<i class=\"icons off\">&#xe08f;</i> Start");
     } else {
       buttonHtml += F("<i class=\"icons on\">&#xe08f;</i> Stop");
     }
     buttonHtml += F("</button>");
 
-    // Add dedicated Home button when endstop is enabled
-    if (endstopEnabled) {
-      buttonHtml += F(" <button class=\"btn btn-xs\" onclick=\"requestJson({motorController:{home:true}});\">");
-      buttonHtml += F("<i class=\"icons\">&#8962;</i> Home");
-      buttonHtml += F("</button>");
-    }
+    // Set Bottom: mark current position as home (0mm).
+    buttonHtml += F(" <button class=\"btn btn-xs\" onclick=\"requestJson({motorController:{setHome:true}});\">");
+    buttonHtml += F("<i class=\"icons\">&#8962;</i> Set Bottom");
+    buttonHtml += F("</button>");
 
     // Fine control: press-and-hold jog buttons.
     // Press starts movement; release/cancel/leave sends stop.
@@ -1172,8 +1321,8 @@ public:
     buttonHtml += F("</button>");
 
     btn.add(buttonHtml);
-    if (endstopEnabled && !isHomed) {
-      btn.add(F(" (Needs homing)"));
+    if (!isHomed) {
+      btn.add(F(" (Set bottom first)"));
     } else {
       btn.add(motorDirection ? F(" (Next: Fwd)") : F(" (Next: Rev)"));
     }
@@ -1249,7 +1398,7 @@ public:
       if (ticksPerMm <= 0) ticksPerMm = 1.0f;
     }
 
-    // Toggle (simulates touch sensor press)
+    // Toggle (simulates button press)
     if (usermod["toggle"].as<bool>()) {
       handleToggleAction();
     }
@@ -1296,20 +1445,23 @@ public:
       beginStart();
     }
 
-    // Home command: move DOWN to find endstop
-    if (usermod["home"].as<bool>() && motorState == IDLE && endstopEnabled) {
-      if (isEndstopTriggered()) {
-        // Already at home
-        isHomed = true;
-        currentPositionMm = 0.0f;
-        positionTicks = 0;
-        setDirectionUp();
-      } else {
-        isHomed = false;
-        setDirectionDown();
-        homeSeekActive = true;
-        beginStart();
-      }
+    // Set Home: mark current position as bottom (0mm).
+    // User jogs the shelf to desired position, then presses "Set Bottom".
+    if (usermod["setHome"].as<bool>() && motorState == IDLE) {
+      isHomed = true;
+      currentPositionMm = 0.0f;
+      positionTicks = 0;
+      setDirectionUp();  // Next movement goes UP (away from new home)
+      publishHomeAssistantSensor();
+    }
+
+    // Legacy home command kept for API compatibility — also sets home at current position
+    if (usermod["home"].as<bool>() && motorState == IDLE) {
+      isHomed = true;
+      currentPositionMm = 0.0f;
+      positionTicks = 0;
+      setDirectionUp();
+      publishHomeAssistantSensor();
     }
 
     if (usermod["resetPos"].as<bool>()) {
@@ -1334,7 +1486,7 @@ public:
     top["lpwmPin"] = lpwmPin;
     top["renPin"] = renPin;
     top["lenPin"] = lenPin;
-    top["touchPin"] = touchPin;
+    top["buttonPin"] = buttonPin;
 
     top["hallAPin"] = hallAPin;
     top["hallBPin"] = hallBPin;
@@ -1344,6 +1496,7 @@ public:
     top["endstopActiveLow"] = endstopActiveLow;
     top["endstopEnabled"] = endstopEnabled;
     top["endstopDebounceMs"] = endstopDebounceMs;
+    top["bottomApproachMm"] = bottomApproachMm;
 
     // Direction mapping
     top["downIsForward"] = downIsForward;
@@ -1398,7 +1551,7 @@ public:
     lpwmPin = 14;
     renPin = 25;
     lenPin = 13;
-    touchPin = 33;
+    buttonPin = 33;
 
     hallAPin = 32;
     hallBPin = 35;
@@ -1408,6 +1561,7 @@ public:
     endstopActiveLow = true;
     endstopEnabled = true;
     endstopDebounceMs = 20;
+    bottomApproachMm = 50.0f;
 
     // Direction mapping defaults
     downIsForward = false;
@@ -1426,7 +1580,7 @@ public:
     targetDistanceEnabled = true;
     ticksPerMm = 1.0f;
 
-    accelTimeMs = 800;
+    accelTimeMs = 1500;
     decelTimeMs = 800;
     safetyMaxRunMs = 20000;
 
@@ -1464,7 +1618,7 @@ public:
     ok &= getJsonValue(top["lpwmPin"], lpwmPin);
     ok &= getJsonValue(top["renPin"], renPin);
     ok &= getJsonValue(top["lenPin"], lenPin);
-    ok &= getJsonValue(top["touchPin"], touchPin);
+    ok &= getJsonValue(top["buttonPin"], buttonPin);
 
     ok &= getJsonValue(top["hallAPin"], hallAPin);
     ok &= getJsonValue(top["hallBPin"], hallBPin);
@@ -1476,6 +1630,7 @@ public:
     ok &= getJsonValue(top["endstopActiveLow"], endstopActiveLow);
     ok &= getJsonValue(top["endstopEnabled"], endstopEnabled);
     ok &= getJsonValue(top["endstopDebounceMs"], endstopDebounceMs);
+    ok &= getJsonValue(top["bottomApproachMm"], bottomApproachMm);
 
     // Direction mapping
     ok &= getJsonValue(top["downIsForward"], downIsForward);
@@ -1571,7 +1726,7 @@ public:
     MCINFO("lpwmPin", "<i>BTS7960 LPWM — PWM for retract direction</i>");
     MCINFO("renPin", "<i>BTS7960 R_EN — enable extend half-bridge</i>");
     MCINFO("lenPin", "<i>BTS7960 L_EN — enable retract half-bridge</i>");
-    MCINFO("touchPin", "<i>Capacitive touch or button input</i>");
+    MCINFO("buttonPin", "<i>Momentary button input (to GND)</i>");
     MCINFO("hallAPin", "<i>Quadrature encoder channel A</i>");
     MCINFO("hallBPin", "<i>Quadrature encoder channel B</i>");
 
@@ -1580,6 +1735,7 @@ public:
     MCINFO("endstopActiveLow", "<i>true = LOW when triggered (NO switch + pull-up)</i>");
     MCINFO("endstopEnabled", "<i>Enable bottom endstop for homing &amp; safety</i>");
     MCINFO("endstopDebounceMs", "ms <i>Endstop switch debounce time (10-50ms for mechanical)</i>");
+    MCINFO("bottomApproachMm", "mm <i>Start decelerating this far above bottom (0 = hard stop only)</i>");
 
     // Direction & travel
     MCINFO("downIsForward", "<i>false = reverse is DOWN (toward endstop)</i>");
@@ -1589,7 +1745,7 @@ public:
     MCINFO("stallDetectionEnabled", "<i>Stop motor if encoder reports no movement</i>");
     MCINFO("stallTimeoutMs", "ms <i>No encoder pulse for this long = stalled (100-300)</i>");
     MCINFO("stallStartGraceMs", "ms <i>Grace period after start before stall checks begin</i>");
-    MCINFO("maxTravelDistance", "mm <i>Max UP travel from home (firmware limit: 457.2mm / 18&quot;)</i>");
+    MCINFO("maxTravelDistance", "mm <i>Max UP travel from bottom (firmware limit: 762mm / 30&quot;)</i>");
 
     // Distance/position settings
     MCINFO("ticksPerMm", "<i>Hall ticks per millimeter for distance/position</i>");
@@ -1660,7 +1816,7 @@ public:
       action.toLowerCase();
 
       if (action == "toggle" || action == "press") {
-        // Toggle motor state (like pressing the touch button)
+        // Toggle motor state (like pressing the button)
         if (motorState == IDLE) {
           beginStart();
         } else {
@@ -1697,21 +1853,14 @@ public:
           beginStart();
         }
         return true;
-      } else if (action == "home") {
-        // Home: move down to find endstop
-        if (motorState == IDLE && endstopEnabled) {
-          if (isEndstopTriggered()) {
-            isHomed = true;
-            currentPositionMm = 0.0f;
-            positionTicks = 0;
-            setDirectionUp();
-            publishHomeAssistantSensor();
-          } else {
-            isHomed = false;
-            setDirectionDown();
-            homeSeekActive = true;
-            beginStart();
-          }
+      } else if (action == "home" || action == "sethome") {
+        // Set current position as home (0mm)
+        if (motorState == IDLE) {
+          isHomed = true;
+          currentPositionMm = 0.0f;
+          positionTicks = 0;
+          setDirectionUp();
+          publishHomeAssistantSensor();
         }
         return true;
       }
