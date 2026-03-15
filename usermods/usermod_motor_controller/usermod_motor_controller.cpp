@@ -12,6 +12,7 @@
  * - Firmware travel limit (30" / 762mm) to protect linear actuator stroke
  * - Homing sequence: motor must find bottom endstop before allowing upward travel
  * - Safe boot: motor never moves automatically on power-up
+ * - Auto-homing: on first button press when unhomed, seeks bottom via stall, backs off, sets home
  *
  * Updates:
  * - Lower default PWM frequency (1kHz)
@@ -295,6 +296,12 @@ private:
   bool lastActiveMovingDown = false; // Snapshot of isMovingDown() before direction toggle (for coast tracking)
   bool manualJogActive = false; // true while UI hold-to-jog controls are active
   bool homeSeekActive = false;  // true only while explicit HOME command is seeking endstop
+
+  // Auto-homing: on first button press when unhomed, seek bottom by stalling, then back off
+  bool autoHomingActive = false;        // Auto-homing sequence in progress
+  bool autoHomingPhaseBackoff = false;  // false = seeking down, true = backing off up
+  int  homingPwmMax = 100;             // Slow PWM for auto-homing seek (0-255)
+  float homingBackoffMm = 2.0f;       // Distance to back up after finding bottom (mm)
   unsigned long runStartTime = 0;
 
   // ramp controller
@@ -325,12 +332,24 @@ private:
   bool ledControlEnabled = true;     // Enable LED on/off based on motor direction
   bool ledInvertDirection = false;   // false: forward=opening (LEDs on), true: forward=closing (LEDs off)
   uint8_t ledSavedBri = 128;         // Saved brightness to restore when turning LEDs back on
+  float ledOffDistanceMm = 10.0f;    // LEDs turn off when position is within this distance of bottom (mm)
+  bool bootLedApplied = false;       // Flag to defer LED init to first loop (after WLED loads boot preset)
 
   // ---------------------------
-  // LED Control (turn on/off based on lid state)
+  // LED Control (turn on/off based on lid position)
   // ---------------------------
-  void updateLedState(bool lidIsOpen) {
+  void updateLedState() {
     if (!ledControlEnabled) return;
+
+    // When homed, use position to determine LED state.
+    // LEDs ON when shelf is above the "off" threshold, OFF when near bottom.
+    bool lidIsOpen;
+    if (isHomed) {
+      lidIsOpen = (currentPositionMm > ledOffDistanceMm);
+    } else {
+      // Not homed — leave LEDs in their current state (don't touch them)
+      return;
+    }
 
     if (lidIsOpen) {
       // Lid is open - turn LEDs ON (restore saved brightness)
@@ -346,13 +365,6 @@ private:
         stateUpdated(CALL_MODE_DIRECT_CHANGE);
       }
     }
-  }
-
-  // Determine if moving in "opening" direction based on config
-  bool isOpeningDirection(bool direction) {
-    // direction: true = forward, false = reverse
-    // ledInvertDirection: false = forward is opening, true = forward is closing
-    return ledInvertDirection ? !direction : direction;
   }
 
   // ---------------------------
@@ -587,15 +599,44 @@ private:
     kickActive = false;
     spikeSampleCount = 0;
 
-    bool wasOpening = isOpeningDirection(motorDirection);
-    updateLedState(wasOpening);
+    updateLedState();
 
     if (toggleDirectionAfter) {
       motorDirection = !motorDirection;
     }
     manualJogActive = false;
     homeSeekActive = false;
+    autoHomingActive = false;
+    autoHomingPhaseBackoff = false;
 
+    publishHomeAssistantSensor();
+  }
+
+  // Auto-homing: transition from seek-down to backoff-up after finding bottom
+  void beginAutoHomingBackoff() {
+    brakeMotor();
+    motorState = IDLE;
+    kickActive = false;
+    spikeSampleCount = 0;
+    autoHomingPhaseBackoff = true;
+    homeSeekActive = true;
+    setDirectionUp();
+    beginStart();
+  }
+
+  // Auto-homing: complete the sequence and set home position
+  void completeAutoHoming() {
+    brakeMotor();
+    motorState = IDLE;
+    kickActive = false;
+    autoHomingActive = false;
+    autoHomingPhaseBackoff = false;
+    homeSeekActive = false;
+    isHomed = true;
+    currentPositionMm = 0.0f;
+    positionTicks = 0;
+    setDirectionUp();
+    updateLedState();
     publishHomeAssistantSensor();
   }
 
@@ -619,11 +660,7 @@ private:
     // Save direction before toggle so coast-down ticks are tracked correctly
     lastActiveMovingDown = isMovingDown();
 
-    // Update LED state based on the direction we just finished
-    // If we were opening (moving in opening direction), lid is now open -> LEDs ON
-    // If we were closing (moving in closing direction), lid is now closed -> LEDs OFF
-    bool wasOpening = isOpeningDirection(motorDirection);
-    updateLedState(wasOpening);  // wasOpening means lid is now open
+    updateLedState();
 
     motorState = IDLE;
 
@@ -632,6 +669,8 @@ private:
     motorDirection = !motorDirection;
     manualJogActive = false;
     homeSeekActive = false;
+    autoHomingActive = false;
+    autoHomingPhaseBackoff = false;
 
     spikeSampleCount = 0;
     publishHomeAssistantSensor();
@@ -642,6 +681,12 @@ private:
     // Pre-start safety checks
     // ---------------------------
     if (endstopEnabled && !manualJogActive) {
+      // Auto up/down requires homing first. User must jog to the desired
+      // bottom position and press "Set Bottom" before auto movement is allowed.
+      if (!isHomed && !homeSeekActive && !autoHomingActive) {
+        return;  // Not homed — refuse auto movement
+      }
+
       // If trying to go DOWN but endstop is already triggered,
       // redirect to UP and continue (don't silently consume the button press)
       if (isMovingDown() && isEndstopTriggered()) {
@@ -680,10 +725,8 @@ private:
       g_endstopMotorArmed = true;
     }
 
-    // If we're starting to open the lid, turn LEDs on immediately
-    if (isOpeningDirection(motorDirection)) {
-      updateLedState(true);  // Lid is opening -> LEDs ON
-    }
+    // Update LEDs based on current position (will turn on if above threshold)
+    updateLedState();
 
     // Start at pwmMin (note: some motors won't move until higher PWM)
     applyPwm(constrain(pwmMin, 0, 255));
@@ -692,6 +735,11 @@ private:
     rampStartTime = millis();
     rampStartPwm = currentPwm;
     rampTargetPwm = pwmMax;
+
+    // Auto-homing uses reduced speed for safety
+    if (autoHomingActive) {
+      rampTargetPwm = constrain(homingPwmMax, pwmMin, pwmMax);
+    }
 
     publishHomeAssistantSensor();
   }
@@ -720,6 +768,16 @@ private:
   // Shared toggle behavior for physical button and Info panel button.
   void handleToggleAction() {
     if (motorState == IDLE) {
+      // If not homed, first button press starts auto-homing:
+      // move down slowly until stall/endstop, back off, set home.
+      if (!isHomed && endstopEnabled) {
+        autoHomingActive = true;
+        autoHomingPhaseBackoff = false;
+        homeSeekActive = true;
+        setDirectionDown();
+        beginStart();
+        return;
+      }
       homeSeekActive = false;
       beginStart();
     } else if (motorState == STOPPING) {
@@ -842,7 +900,10 @@ private:
       } else {
         currentPositionMm += tickDistanceMm;
       }
-      if (currentPositionMm < 0.0f) currentPositionMm = 0.0f;
+      // Do NOT clamp to 0 here — let position go negative so coast-down
+      // ticks after braking are tracked honestly. The endstop ISR/polled check
+      // resets to 0 when the physical endstop triggers. Clamping here would
+      // eat coast ticks and cause cumulative downward drift each cycle.
     }
   }
 
@@ -1000,18 +1061,17 @@ public:
         currentPositionMm = 0.0f;
         positionTicks = 0;
         setDirectionUp();  // Next movement should go UP
-        // Lid is closed/down — LEDs should be OFF
-        updateLedState(false);
       } else {
         // Endstop NOT triggered — position is unknown.
-        // User must jog to desired bottom and press "Set Bottom" to home.
+        // First button press will auto-home (slow descent until stall, back off, set home).
+        // Users can also manually jog down and press "Set Bottom".
         // Motor will NOT move automatically (safety: prevent pinch on power-up).
         isHomed = false;
         currentPositionMm = 0.0f;
-        // Position unknown — default LEDs OFF for safety
-        updateLedState(false);
       }
     }
+    // LED state is deferred to first loop() iteration (bootLedApplied flag)
+    // so that WLED's boot preset has time to load the user's saved color/brightness.
 
     initDone = true;
   }
@@ -1019,11 +1079,27 @@ public:
   void loop() {
     if (!enabled || !initDone) return;
 
+    // Deferred boot LED: apply on first loop iteration after WLED's boot preset
+    // has loaded the user's saved color/brightness settings.
+    if (!bootLedApplied) {
+      bootLedApplied = true;
+      if (isHomed && currentPositionMm <= ledOffDistanceMm) {
+        // Shelf is at bottom — save the user's boot brightness, then turn off
+        if (bri > 0) ledSavedBri = bri;
+        bri = 0;
+        stateUpdated(CALL_MODE_DIRECT_CHANGE);
+      }
+      // If shelf is up or not homed, leave WLED's loaded state alone
+    }
+
     // Motor control must run every iteration regardless of strip updates.
     // GPIO reads, PWM writes, and button detection are safe during DMA.
 
     // Process hall updates frequently
     processHallIfPending();
+
+    // Update LED state based on current position (reacts to movement)
+    updateLedState();
 
     // Update debounced endstop state every iteration
     updateEndstopDebounce();
@@ -1045,12 +1121,13 @@ public:
         currentPwm = 0;
         manualJogActive = false;
         homeSeekActive = false;
+        autoHomingActive = false;
+        autoHomingPhaseBackoff = false;
         isHomed = true;
         currentPositionMm = 0.0f;
         positionTicks = 0;
         setDirectionUp();
-        bool wasOpening = isOpeningDirection(motorDirection);
-        updateLedState(wasOpening);
+        updateLedState();
         publishHomeAssistantSensor();
         return;
       }
@@ -1105,14 +1182,20 @@ public:
 
     // State machine
     if (motorState == STARTING) {
-      if (!manualJogActive && millis() - runStartTime >= safetyMaxRunMs) {
+      if (!manualJogActive && !autoHomingActive && millis() - runStartTime >= safetyMaxRunMs) {
         beginStop(STOP_TIMEOUT);
       } else {
         const unsigned long runElapsed = millis() - runStartTime;
         // During ramp-up, allow some time to avoid false trips before the motor gains momentum.
         // Hard-stop checks remain fully active in RUNNING state.
         if (runElapsed >= stallStartGraceMs && pollCurrentAndCheckSpike()) {
-          immediateStop(STOP_SPIKE, !manualJogActive);
+          if (autoHomingActive && !autoHomingPhaseBackoff) {
+            beginAutoHomingBackoff();
+          } else if (autoHomingActive && autoHomingPhaseBackoff) {
+            completeAutoHoming();
+          } else {
+            immediateStop(STOP_SPIKE, !manualJogActive);
+          }
           return;
         }
         updateStartSequence();
@@ -1123,16 +1206,24 @@ public:
     if (motorState == RUNNING) {
       const unsigned long elapsed = millis() - runStartTime;
 
-      // Safety timeout
-      if (!manualJogActive && elapsed >= safetyMaxRunMs) {
+      // Safety timeout (skipped during auto-homing — stall detection is the stop mechanism)
+      if (!manualJogActive && !autoHomingActive && elapsed >= safetyMaxRunMs) {
         beginStop(STOP_TIMEOUT);
         return;
       }
 
       // Target distance reached => smooth auto-stop
-      if (!manualJogActive && hasReachedTargetDistance()) {
+      if (!manualJogActive && !autoHomingActive && hasReachedTargetDistance()) {
         beginStop(STOP_TARGET_REACHED);
         return;
+      }
+
+      // Auto-homing backoff: stop after backing up homingBackoffMm from stall point
+      if (autoHomingActive && autoHomingPhaseBackoff) {
+        if (getDistanceTraveled() >= homingBackoffMm) {
+          completeAutoHoming();
+          return;
+        }
       }
 
       // Hard floor: bottom is a physical stop — immediate power cut at 0mm.
@@ -1160,13 +1251,23 @@ public:
 
       // Encoder stall detection (Safety Layer 2): no hall tick in stallTimeoutMs
       if (stallDetectionEnabled) {
+        bool stalled = false;
         if (!hallSeenThisRun) {
-          // Allow additional startup grace before first encoder pulse.
-          if (elapsed > (accelTimeMs + stallStartGraceMs)) {
-            immediateStop(STOP_STALL, !manualJogActive);
+          if (elapsed > (accelTimeMs + stallStartGraceMs)) stalled = true;
+        } else if (millis() - lastHallTickTime > stallTimeoutMs) {
+          stalled = true;
+        }
+        if (stalled) {
+          if (autoHomingActive && !autoHomingPhaseBackoff) {
+            // Stall during homing seek-down = found bottom, start backoff
+            beginAutoHomingBackoff();
             return;
           }
-        } else if (millis() - lastHallTickTime > stallTimeoutMs) {
+          if (autoHomingActive && autoHomingPhaseBackoff) {
+            // Stall during backoff — set home at current position
+            completeAutoHoming();
+            return;
+          }
           immediateStop(STOP_STALL, !manualJogActive);
           return;
         }
@@ -1174,6 +1275,14 @@ public:
 
       // Current spike => immediate hard stop for minimum fault latency.
       if (pollCurrentAndCheckSpike()) {
+        if (autoHomingActive && !autoHomingPhaseBackoff) {
+          beginAutoHomingBackoff();
+          return;
+        }
+        if (autoHomingActive && autoHomingPhaseBackoff) {
+          completeAutoHoming();
+          return;
+        }
         immediateStop(STOP_SPIKE, !manualJogActive);
         return;
       }
@@ -1217,7 +1326,11 @@ public:
 
     // Homing / position status
     JsonArray homeStatus = user.createNestedArray("Bottom Set");
-    homeStatus.add(isHomed ? "Yes" : "NO - jog to position & press Set Bottom");
+    if (autoHomingActive) {
+      homeStatus.add(autoHomingPhaseBackoff ? "Auto-homing (backing off)" : "Auto-homing (seeking bottom)");
+    } else {
+      homeStatus.add(isHomed ? "Yes" : "NO - press button to auto-home");
+    }
 
     if (endstopEnabled) {
       JsonArray endstopStatus = user.createNestedArray("Endstop");
@@ -1359,6 +1472,8 @@ public:
 
     // Endstop / homing state
     usermod["isHomed"] = isHomed;
+    usermod["autoHoming"] = autoHomingActive;
+    usermod["autoHomingPhase"] = autoHomingActive ? (autoHomingPhaseBackoff ? "backoff" : "seeking") : "none";
     usermod["endstopTriggered"] = endstopEnabled ? isEndstopTriggered() : false;
     usermod["currentPositionMm"] = currentPositionMm;
     usermod["maxTravelDistance"] = maxTravelDistance;
@@ -1455,6 +1570,15 @@ public:
       publishHomeAssistantSensor();
     }
 
+    // Auto-home: seek bottom by stalling, then back off and set home
+    if (usermod["autoHome"].as<bool>() && motorState == IDLE && !isHomed) {
+      autoHomingActive = true;
+      autoHomingPhaseBackoff = false;
+      homeSeekActive = true;
+      setDirectionDown();
+      beginStart();
+    }
+
     // Legacy home command kept for API compatibility — also sets home at current position
     if (usermod["home"].as<bool>() && motorState == IDLE) {
       isHomed = true;
@@ -1497,6 +1621,10 @@ public:
     top["endstopEnabled"] = endstopEnabled;
     top["endstopDebounceMs"] = endstopDebounceMs;
     top["bottomApproachMm"] = bottomApproachMm;
+
+    // Auto-homing settings
+    top["homingPwmMax"] = homingPwmMax;
+    top["homingBackoffMm"] = homingBackoffMm;
 
     // Direction mapping
     top["downIsForward"] = downIsForward;
@@ -1542,6 +1670,8 @@ public:
     // LED control settings
     top["ledControlEnabled"] = ledControlEnabled;
     top["ledInvertDirection"] = ledInvertDirection;
+    top["ledSavedBri"] = ledSavedBri;
+    top["ledOffDistanceMm"] = ledOffDistanceMm;
   }
 
   bool readFromConfig(JsonObject& root) {
@@ -1562,6 +1692,10 @@ public:
     endstopEnabled = true;
     endstopDebounceMs = 20;
     bottomApproachMm = 50.0f;
+
+    // Auto-homing defaults
+    homingPwmMax = 100;
+    homingBackoffMm = 2.0f;
 
     // Direction mapping defaults
     downIsForward = false;
@@ -1607,6 +1741,8 @@ public:
     // LED control defaults
     ledControlEnabled = true;
     ledInvertDirection = false;
+    ledSavedBri = 128;
+    ledOffDistanceMm = 10.0f;
 
     JsonObject top = root["MotorController"];
     if (top.isNull()) return false;
@@ -1631,6 +1767,14 @@ public:
     ok &= getJsonValue(top["endstopEnabled"], endstopEnabled);
     ok &= getJsonValue(top["endstopDebounceMs"], endstopDebounceMs);
     ok &= getJsonValue(top["bottomApproachMm"], bottomApproachMm);
+
+    // Auto-homing settings
+    ok &= getJsonValue(top["homingPwmMax"], homingPwmMax);
+    ok &= getJsonValue(top["homingBackoffMm"], homingBackoffMm);
+    if (homingPwmMax < 30) homingPwmMax = 30;
+    if (homingPwmMax > 255) homingPwmMax = 255;
+    if (homingBackoffMm < 0) homingBackoffMm = 0;
+    if (homingBackoffMm > 50) homingBackoffMm = 50;
 
     // Direction mapping
     ok &= getJsonValue(top["downIsForward"], downIsForward);
@@ -1693,6 +1837,10 @@ public:
     // LED control settings
     ok &= getJsonValue(top["ledControlEnabled"], ledControlEnabled);
     ok &= getJsonValue(top["ledInvertDirection"], ledInvertDirection);
+    ok &= getJsonValue(top["ledSavedBri"], ledSavedBri);
+    ok &= getJsonValue(top["ledOffDistanceMm"], ledOffDistanceMm);
+    if (ledSavedBri < 1) ledSavedBri = 128;
+    if (ledOffDistanceMm < 0) ledOffDistanceMm = 0;
 
     // Update ISR globals if pins changed via config (NOTE: interrupts already attached)
     g_hallAPin = (uint8_t)hallAPin;
@@ -1736,6 +1884,10 @@ public:
     MCINFO("endstopEnabled", "<i>Enable bottom endstop for homing &amp; safety</i>");
     MCINFO("endstopDebounceMs", "ms <i>Endstop switch debounce time (10-50ms for mechanical)</i>");
     MCINFO("bottomApproachMm", "mm <i>Start decelerating this far above bottom (0 = hard stop only)</i>");
+
+    // Auto-homing
+    MCINFO("homingPwmMax", "<i>PWM speed for auto-homing seek (30-255, lower = slower/safer)</i>");
+    MCINFO("homingBackoffMm", "mm <i>Distance to back off after finding bottom (0-50)</i>");
 
     // Direction & travel
     MCINFO("downIsForward", "<i>false = reverse is DOWN (toward endstop)</i>");
@@ -1781,6 +1933,8 @@ public:
     // LED control
     MCINFO("ledControlEnabled", "<i>Turn LEDs on/off based on lid position</i>");
     MCINFO("ledInvertDirection", "<i>Swap which direction is open vs closed</i>");
+    MCINFO("ledSavedBri", "<i>Saved brightness restored when lid opens (persists across reboots)</i>");
+    MCINFO("ledOffDistanceMm", "mm <i>LEDs turn off when within this distance of bottom (0 = off only at 0mm)</i>");
 
     #undef MCINFO
   }
@@ -1850,6 +2004,16 @@ public:
         if (motorState == IDLE) {
           homeSeekActive = false;
           motorDirection = ledInvertDirection;  // Set to closing direction
+          beginStart();
+        }
+        return true;
+      } else if (action == "autohome") {
+        // Auto-home: seek bottom by stalling, then back off and set home
+        if (motorState == IDLE && !isHomed) {
+          autoHomingActive = true;
+          autoHomingPhaseBackoff = false;
+          homeSeekActive = true;
+          setDirectionDown();
           beginStart();
         }
         return true;
