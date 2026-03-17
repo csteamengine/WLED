@@ -610,6 +610,7 @@ private:
     autoHomingPhaseBackoff = false;
 
     publishHomeAssistantSensor();
+    serializeConfigToFS();
   }
 
   // Auto-homing: transition from seek-down to backoff-up after finding bottom
@@ -638,6 +639,7 @@ private:
     setDirectionUp();
     updateLedState();
     publishHomeAssistantSensor();
+    serializeConfigToFS();
   }
 
   void beginStop(StopReason reason) {
@@ -674,6 +676,7 @@ private:
 
     spikeSampleCount = 0;
     publishHomeAssistantSensor();
+    serializeConfigToFS();
   }
 
   void beginStart() {
@@ -1129,6 +1132,7 @@ public:
         setDirectionUp();
         updateLedState();
         publishHomeAssistantSensor();
+        serializeConfigToFS();
         return;
       }
 
@@ -1672,6 +1676,10 @@ public:
     top["ledInvertDirection"] = ledInvertDirection;
     top["ledSavedBri"] = ledSavedBri;
     top["ledOffDistanceMm"] = ledOffDistanceMm;
+
+    // Persist position across reboots (motor can't move while off)
+    top["savedPositionMm"] = currentPositionMm;
+    top["savedIsHomed"] = isHomed;
   }
 
   bool readFromConfig(JsonObject& root) {
@@ -1841,6 +1849,17 @@ public:
     ok &= getJsonValue(top["ledOffDistanceMm"], ledOffDistanceMm);
     if (ledSavedBri < 1) ledSavedBri = 128;
     if (ledOffDistanceMm < 0) ledOffDistanceMm = 0;
+
+    // Restore saved position across reboots (motor can't move while off)
+    float savedPos = 0.0f;
+    bool savedHomed = false;
+    if (getJsonValue(top["savedPositionMm"], savedPos) &&
+        getJsonValue(top["savedIsHomed"], savedHomed) && savedHomed) {
+      if (savedPos >= 0.0f && savedPos <= FIRMWARE_MAX_TRAVEL_MM) {
+        currentPositionMm = savedPos;
+        isHomed = true;
+      }
+    }
 
     // Update ISR globals if pins changed via config (NOTE: interrupts already attached)
     g_hallAPin = (uint8_t)hallAPin;
