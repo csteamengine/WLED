@@ -3,7 +3,7 @@ name: WLED Build
 # Only included into other workflows
 on:
   workflow_call:
-  
+
 jobs:
 
   get_default_envs:
@@ -39,7 +39,7 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version-file: '.nvmrc'
-        cache: 'npm'
+
     - run: |
         npm ci
         VERSION=`date +%y%m%d0`
@@ -80,6 +80,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version-file: '.nvmrc'
-          cache: 'npm'
+
       - run: npm ci
       - run: npm test
